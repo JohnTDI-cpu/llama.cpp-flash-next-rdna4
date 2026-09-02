@@ -1430,6 +1430,12 @@ struct johnv8_q8_cache {
     static const int N = 6;
     entry e[N]; int next = 0; uint64_t eval = 1; uint64_t hits = 0, misses = 0;
     std::vector<char *> graveyard;
+    ~johnv8_q8_cache() {
+        if (getenv("GGML_JOHNV8_Q8_STATS") != nullptr) {
+            fprintf(stderr, "[johnv8] q8 dedup: hits=%llu misses=%llu evals=%llu\n",
+                    (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) eval);
+        }
+    }
     void bump() { eval++; }
     void invalidate(const ggml_tensor * dst) {
         const ggml_tensor * base = dst->view_src ? dst->view_src : dst;
