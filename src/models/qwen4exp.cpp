@@ -805,6 +805,11 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        // E3 [johnv8]: w rezimie gestym (n_kv <= budzet top-k) tensory QSA nie sa w grafie,
+        // wiec alokator nie dal im bufora - klucze indeksera i tak poszly do cache'u wyzej.
+        if (cell_blk == nullptr || cell_blk->buffer == nullptr) {
+            return;
+        }
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
     }
 

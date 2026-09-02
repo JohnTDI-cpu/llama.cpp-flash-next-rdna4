@@ -47,8 +47,8 @@ static __global__ void shexp_tail_f32(
 #endif
     const float sg = 1.0f / (1.0f + expf(-g));
     const int64_t id = (int64_t) i + (int64_t) n_embd*t;
-    const float m = shexp[id] * sg;
-    dst[id] = moe_out[id] + m;
+    const float m = __fmul_rn(shexp[id], sg);   // jak binbcast MUL, bez kontrakcji FMA
+    dst[id] = __fadd_rn(moe_out[id], m);  // jak binbcast ADD
 }
 
 static bool ggml_cuda_shexp_overlap(const ggml_tensor * a, const ggml_tensor * b) {
