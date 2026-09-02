@@ -12,7 +12,9 @@
 
 // GGML_JOHNV8_HCBLOCK: 0 = wylaczone, 1 = oba jadra (domyslnie), 2 = tylko A, 3 = tylko B (diagnostyka)
 static int ggml_cuda_hcblock_mode() {
-    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 1 : atoi(e); }();
+    // domyslnie OFF: pod MTP (nt=4) jadro A ma za malo blokow (10) i liczy normy/kwantyzacje 10x -> 55 us/launch,
+    // wolniej niz stock (E25/E32). Do czasu refaktoru (A0/A1/B1) wlaczac jawnie GGML_JOHNV8_HCBLOCK=1.
+    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 0 : atoi(e); }();
     return v;
 }
 bool ggml_cuda_hcblock_enabled() {
