@@ -383,7 +383,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     // [johnv8] E10c: jadro B czyta lo we wszystkich blokach, a alokator moglby nalozyc na nie wynik mix
     // (lo jest martwe po hc_up w stocku) -> przypinamy lo, zeby nie bylo ponownie uzyte
-    static const bool hcblock_pin = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr || atoi(e) != 0; }();
+    // UWAGA (E27): samo przypiecie zmienia alokacje calego grafu i ujawnia gdzies wyscig/aliasing (logity +-1 nat,
+    // niedeterministycznie) -> domyslnie WYLACZONE; bez pinu matcher B po prostu odrzuca fuzje, gdy mixed nachodzi na lo.
+    static const bool hcblock_pin = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK_PIN"); return e != nullptr && atoi(e) != 0; }();
     if (hcblock_pin) {
         ggml_set_output(lo);
     }
