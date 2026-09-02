@@ -4280,6 +4280,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 7;
     }
 
+    // [johnv8] E10a: MUL_MAT(hc_inject) + lancuch combine (9 wezlow) -> jedno jadro
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_hc_combine_inject_ok(cgraph, i)) {
+        ggml_cuda_op_hc_combine_inject(*cuda_ctx, cgraph, i);
+        return 8;
+    }
+
     // [johnv8] E6b: sigmoid(gate) * shexp + moe_out -> jedno jadro
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { GGML_UNARY_OP_SIGMOID })
         && ggml_cuda_shexp_tail_ok(cgraph, i)) {

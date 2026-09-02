@@ -267,3 +267,227 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cgraph 
             s_in, b_in, s_w, b_w,
             (int) n_embd, (int) hc);
 }
+
+// ============================================================================
+// [johnv8] E10a: hc_inject wciagniety do combine
+// ============================================================================
+#include "mmvf.cuh"
+
+static bool ggml_cuda_inject_fuse_enabled() {
+    static const bool v = []() { const char * e = getenv("GGML_JOHNV8_INJECT_FUSE"); return e == nullptr || atoi(e) != 0; }();
+    return v;
+}
+static int ggml_cuda_inject_use_fma() {
+    static const int v = []() { const char * e = getenv("GGML_JOHNV8_INJECT_FMA"); return e == nullptr ? 1 : atoi(e); }();
+    return v;
+}
+
+template <int block_size>
+static __global__ void hc_combine_inject_f32(
+        const float * __restrict__ W,          // [ncols, hc] f32, wiersz c = W + c*ncols
+        const float * __restrict__ hnorm,      // [ncols, nt] f32
+        const float * __restrict__ residual,   // [n_embd, hc, nt]
+        const float * __restrict__ block_out,  // [n_embd, nt]
+        float       * __restrict__ dst,        // [n_embd, hc, nt]
+        const float                scale_in,
+        const float                bias_in,
+        const float                scale_w,
+        const float                bias_w,
+        const int                  n_embd,
+        const int                  hc,
+        const int                  ncols,
+        const int                  use_fma) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int c   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    __shared__ float buf_iw[warp_size];
+    __shared__ float s_val;
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+    // --- iloczyn skalarny jak mul_mat_vec_f<float, float, ncols_dst, block_size> dla wiersza c, kolumny t
+    const float2 * x2 = (const float2 *) (W     + (int64_t) c * ncols);
+    const float2 * y2 = (const float2 *) (hnorm + (int64_t) t * ncols);
+    const int ncols2 = ncols / 2;
+    float sumf = 0.0f;
+    if (use_fma) {
+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            const float2 tx = x2[col2];
+            const float2 ty = y2[col2];
+            sumf = fmaf(tx.x, ty.x, sumf);
+            sumf = fmaf(tx.y, ty.y, sumf);
+        }
+    } else {
+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            const float2 tx = x2[col2];
+            const float2 ty = y2[col2];
+            sumf += tx.x * ty.x;
+            sumf += tx.y * ty.y;
+        }
+    }
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    if (block_size > warp_size) {
+        buf_iw[tid / warp_size] = sumf;
+        __syncthreads();
+        if (tid < warp_size) {
+            sumf = buf_iw[tid];
+            sumf = warp_reduce_sum<warp_size>(sumf);
+        }
+    }
+    if (tid == 0) {
+        s_val = sumf;
+    }
+    __syncthreads();
+    // --- reszta jak hc_combine_f32
+    float in = s_val;
+#if defined(__AMDGCN__)
+    __asm__("" : "+v"(in));
+#endif
+    const float s  = scale_in * in + bias_in;
+    const float sg = 1.0f / (1.0f + expf(-s));
+    const float w  = scale_w * sg + bias_w;
+    for (int i = tid; i < n_embd; i += block_size) {
+        const int64_t ib = (int64_t) i + (int64_t) n_embd*t;
+        const int64_t id = (int64_t) i + (int64_t) n_embd*((int64_t) c + (int64_t) hc*t);
+        const float m = block_out[ib] * w;
+        dst[id] = residual[id] + m;
+    }
+}
+
+bool ggml_cuda_hc_combine_inject_ok(const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_cuda_inject_fuse_enabled()) {
+        return false;
+    }
+    if (node_idx < 0 || node_idx + 8 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_cuda_hc_combine_ok(cgraph, node_idx + 1)) {
+        return false;
+    }
+    const ggml_tensor * scale_in = cgraph->nodes[node_idx + 1];
+    if (scale_in->src[0] != mm) {
+        return false;
+    }
+    const ggml_tensor * W  = mm->src[0];
+    const ggml_tensor * hn = mm->src[1];
+    if (!W || !hn || W->type != GGML_TYPE_F32 || hn->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * add = cgraph->nodes[node_idx + 8];
+    const int64_t n_embd = add->ne[0];
+    const int64_t hc     = add->ne[1];
+    const int64_t nt     = add->ne[2];
+    const int64_t ncols  = n_embd * hc;
+    if (W->ne[0] != ncols || W->ne[1] != hc || W->ne[2] != 1 || W->ne[3] != 1) {
+        return false;
+    }
+    if (hn->ne[0] != ncols || hn->ne[1] != nt || hn->ne[2] != 1 || hn->ne[3] != 1) {
+        return false;
+    }
+    if (mm->ne[0] != hc || mm->ne[1] != nt || mm->ne[2] != 1 || mm->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(W) || !ggml_is_contiguous(hn) || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    if (ncols % 2 != 0 || ncols > INT32_MAX || n_embd > INT32_MAX) {
+        return false;
+    }
+    // stock liczy ten matmul przez mul_mat_vec_f (nt <= 8 na AMD) - replikujemy dokladnie te sciezke
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!ggml_cuda_should_use_mmvf(GGML_TYPE_F32, cc, W->ne, W->nb, nt)) {
+        return false;
+    }
+    // wynik MUL_MAT i posrednie wezly nie moga byc uzywane poza lancuchem
+    const enum ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
+                                  cgraph->nodes[node_idx + 5]->op, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD };
+    const int32_t out_idx = node_idx + 8;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 9, ops, &out_idx, 1)) {
+        return false;
+    }
+    if (ggml_cuda_hc_overlap(add, W) || ggml_cuda_hc_overlap(add, hn)) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_op_hc_combine_inject(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mm       = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * scale_in = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scale_w  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * rs_b     = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * add      = cgraph->nodes[node_idx + 8];
+    const ggml_tensor * W         = mm->src[0];
+    const ggml_tensor * hn        = mm->src[1];
+    const ggml_tensor * block_out = rs_b->src[0];
+    const ggml_tensor * residual  = add->src[0];
+
+    const int64_t n_embd = add->ne[0];
+    const int64_t hc     = add->ne[1];
+    const int64_t nt     = add->ne[2];
+    const int64_t ncols  = n_embd * hc;
+
+    const float s_in = ggml_get_op_params_f32(scale_in, 0);
+    const float b_in = ggml_get_op_params_f32(scale_in, 1);
+    const float s_w  = ggml_get_op_params_f32(scale_w,  0);
+    const float b_w  = ggml_get_op_params_f32(scale_w,  1);
+
+    // block_size dokladnie jak mul_mat_vec_f_cuda
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int cc        = ggml_cuda_info().devices[device].cc;
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if (cc > GGML_CUDA_CC_OFFSET_AMD && cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+    static bool logged = false;
+    if (!logged && getenv("GGML_CUDA_DUMP_DISPATCH")) {
+        logged = true;
+        fprintf(stderr, "[johnv8] hc_combine_inject fused: ncols=%d hc=%d nt=%d block=%d fma=%d (9 wezlow -> 1 jadro)\n",
+                (int) ncols, (int) hc, (int) nt, (int) block_size_best, ggml_cuda_inject_use_fma());
+    }
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3((unsigned int) hc, (unsigned int) nt, 1), dim3((unsigned int) block_size_best, 1, 1), 0, ctx.stream());
+    const float * W_d  = (const float *) W->data;
+    const float * hn_d = (const float *) hn->data;
+    const float * r_d  = (const float *) residual->data;
+    const float * b_d  = (const float *) block_out->data;
+    float       * d_d  = (float *) add->data;
+    const int fma = ggml_cuda_inject_use_fma();
+#define JOHNV8_INJECT_LAUNCH(BS) \
+        ggml_cuda_kernel_launch(hc_combine_inject_f32<BS>, launch_params, W_d, hn_d, r_d, b_d, d_d, s_in, b_in, s_w, b_w, \
+                                (int) n_embd, (int) hc, (int) ncols, fma)
+    switch (block_size_best) {
+        case  32: JOHNV8_INJECT_LAUNCH(32);  break;
+        case  64: JOHNV8_INJECT_LAUNCH(64);  break;
+        case  96: JOHNV8_INJECT_LAUNCH(96);  break;
+        case 128: JOHNV8_INJECT_LAUNCH(128); break;
+        case 160: JOHNV8_INJECT_LAUNCH(160); break;
+        case 192: JOHNV8_INJECT_LAUNCH(192); break;
+        case 224: JOHNV8_INJECT_LAUNCH(224); break;
+        case 256: JOHNV8_INJECT_LAUNCH(256); break;
+        default: GGML_ABORT("hc_combine_inject: nieobslugiwany block_size %d", (int) block_size_best);
+    }
+#undef JOHNV8_INJECT_LAUNCH
+}
