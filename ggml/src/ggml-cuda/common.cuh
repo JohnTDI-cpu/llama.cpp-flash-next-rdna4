@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 
@@ -1412,7 +1413,54 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// [johnv8] E6d: pamiec podreczna kwantyzacji Q8_1 aktywacji (src1) dla mmvq.
+// Kilka matvecs z tym samym wejsciem (beta|alpha, gate_inp|shexp, indexer q|k) kwantyzuje raz.
+// Klucz: obiekt tensora + data + ne/nb + rozmiar, wazny tylko w biezacym graph_compute (eval).
+// Bit-exact: ponownie uzywany jest dokladnie ten sam wynik kwantyzacji.
+static inline bool johnv8_q8_dedup_enabled() {
+    static const bool v = []() { const char * e = getenv("GGML_JOHNV8_Q8_DEDUP"); return e == nullptr || atoi(e) != 0; }();
+    return v;
+}
+struct johnv8_q8_cache {
+    struct entry {
+        const ggml_tensor * t = nullptr; const void * data = nullptr;
+        int64_t ne[4] = {0,0,0,0}; size_t nb[4] = {0,0,0,0};
+        uint64_t eval = 0; size_t bytes = 0; char * buf = nullptr; size_t cap = 0;
+    };
+    static const int N = 6;
+    entry e[N]; int next = 0; uint64_t eval = 1; uint64_t hits = 0, misses = 0;
+    std::vector<char *> graveyard;
+    void bump() { eval++; }
+    void invalidate(const ggml_tensor * dst) {
+        const ggml_tensor * base = dst->view_src ? dst->view_src : dst;
+        for (auto & x : e) {
+            if (x.t != nullptr && (x.t == dst || x.t == base || (x.t->view_src != nullptr && x.t->view_src == base))) { x.t = nullptr; }
+        }
+    }
+    char * find(const ggml_tensor * t, size_t bytes) {
+        for (auto & x : e) {
+            if (x.t == t && x.eval == eval && x.data == t->data && x.bytes == bytes &&
+                memcmp(x.ne, t->ne, sizeof(x.ne)) == 0 && memcmp(x.nb, t->nb, sizeof(x.nb)) == 0) { hits++; return x.buf; }
+        }
+        misses++; return nullptr;
+    }
+    char * insert(const ggml_tensor * t, size_t bytes) {
+        entry & x = e[next]; next = (next + 1) % N;
+        if (x.cap < bytes) {
+            if (x.buf != nullptr) { graveyard.push_back(x.buf); }   // moze byc jeszcze czytany na strumieniu
+            const size_t cap = bytes > ((size_t) 1 << 20) ? bytes : ((size_t) 1 << 20);
+            void * ptr = nullptr;
+            if (cudaMalloc(&ptr, cap) != cudaSuccess) { x.buf = nullptr; x.cap = 0; x.t = nullptr; return nullptr; }
+            x.buf = (char *) ptr; x.cap = cap;
+        }
+        x.t = t; x.data = t->data; memcpy(x.ne, t->ne, sizeof(x.ne)); memcpy(x.nb, t->nb, sizeof(x.nb));
+        x.eval = eval; x.bytes = bytes;
+        return x.buf;
+    }
+};
+
 struct ggml_backend_cuda_context {
+    johnv8_q8_cache q8cache;   // [johnv8] E6d
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

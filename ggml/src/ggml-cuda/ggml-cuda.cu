@@ -2063,6 +2063,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (johnv8_q8_dedup_enabled()) { ctx.q8cache.invalidate(dst); }   // [johnv8] E6d: zapis w miejsce uniewaznia wpis
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -4553,6 +4554,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->q8cache.bump();   // [johnv8] E6d: wpisy z poprzedniego grafu przestaja byc wazne
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
