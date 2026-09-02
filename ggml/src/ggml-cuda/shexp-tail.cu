@@ -12,7 +12,7 @@
 bool ggml_cuda_shexp_fuse_enabled() {
     static const bool v = []() {
         const char * e  = getenv("GGML_JOHNV8_SHEXP_FUSE");
-        const bool   on = (e == nullptr) || (atoi(e) != 0);
+        const bool   on = (e != nullptr) && (atoi(e) != 0);   // domyslnie OFF: ROZNE tokeny vs stock (E16), do wyjasnienia
         if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
             fprintf(stderr, "[johnv8] shexp_fuse = %d\n", (int) on);
         }

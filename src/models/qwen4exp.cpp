@@ -923,7 +923,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // a maska rzadka rowna sie masce pelnej - wiec gesta uwaga daje ten sam wynik, a oszczedzamy
     // pooling, norme, rope, rzut q, score i top-k (~33 jader na warstwe). Klucze indeksera i tak
     // trafily do cache'u wyzej, wiec po przekroczeniu budzetu sciezka rzadka ma komplet.
-    static const bool e3_on = []() { const char * e = getenv("GGML_JOHNV8_E3"); return e == nullptr || atoi(e) != 0; }();
+    static const bool e3_on = []() { const char * e = getenv("GGML_JOHNV8_E3"); return e != nullptr && atoi(e) != 0; }();   // domyslnie OFF: gesta uwaga nie jest bit-exact ze sciezka rzadka (E16)
     if (e3_on && n_kv <= (int64_t) hparams.indexer_top_k + r - 1) {
         return nullptr;
     }
