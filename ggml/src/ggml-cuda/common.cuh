@@ -1509,7 +1509,10 @@ struct johnv8_fuse_plan {
 };
 
 struct ggml_backend_cuda_context {
-    johnv8_fuse_plan fuse_plan; // [johnv8] E11
+    // [johnv8] E11: plan per graf (scheduler wola graph_compute osobno dla kazdego splitu -> rozne wskazniki cgraph)
+    std::unordered_map<const ggml_cgraph *, johnv8_fuse_plan> fuse_plans;
+    johnv8_fuse_plan * fuse_plan_cur = nullptr;
+    uint64_t fuse_plan_skipped = 0, fuse_plan_probed = 0;
     johnv8_q8_cache q8cache;   // [johnv8] E6d
     johnv8_hcb_scratch hcb;    // [johnv8] E10c
     int device;

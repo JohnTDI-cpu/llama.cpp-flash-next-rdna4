@@ -4482,18 +4482,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = 0;
                 bool johnv8_plan_ok = false;
                 if (johnv8_plan_on) {
-                    auto & P = cuda_ctx->fuse_plan;
                     if (i == 0) {
+                        auto & P = cuda_ctx->fuse_plans[cgraph];
+                        cuda_ctx->fuse_plan_cur = &P;
                         P.graphs++;
                         if (P.graph != cgraph || P.n_nodes != cgraph->n_nodes || (P.graphs % 2000) == 0) { P.reset(cgraph); }
+                        if (cuda_ctx->fuse_plans.size() > 512) { cuda_ctx->fuse_plans.clear(); cuda_ctx->fuse_plan_cur = &cuda_ctx->fuse_plans[cgraph]; cuda_ctx->fuse_plan_cur->reset(cgraph); }
                     }
+                    auto & P = *cuda_ctx->fuse_plan_cur;
                     if (P.n_nodes == cgraph->n_nodes && P.nodes[i] != node) { P.nodes[i] = node; P.skip[i] = 0; }
                     johnv8_plan_ok = P.n_nodes == cgraph->n_nodes;
                     if (johnv8_plan_ok && P.skip[i] == -1) {
-                        P.skipped++;
+                        cuda_ctx->fuse_plan_skipped++;
                     } else {
                         nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
-                        if (johnv8_plan_ok) { P.probed++; if (nodes_to_skip == 0) { P.skip[i] = -1; } }
+                        if (johnv8_plan_ok) { cuda_ctx->fuse_plan_probed++; if (nodes_to_skip == 0) { P.skip[i] = -1; } }
                     }
                 } else {
                     nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -4509,7 +4512,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                     (long long) johnv8_n_graphs, (double) johnv8_n_nodes / johnv8_n_graphs, (double) johnv8_n_fused / johnv8_n_graphs,
                                     (double) johnv8_t_fuse / johnv8_n_nodes, (double) johnv8_t_fwd / (johnv8_n_nodes - johnv8_n_fused + 1),
                                     (double) (johnv8_t_fuse + johnv8_t_fwd) / johnv8_n_graphs / 1000.0,
-                                    (unsigned long long) cuda_ctx->fuse_plan.skipped, (unsigned long long) cuda_ctx->fuse_plan.probed);
+                                    (unsigned long long) cuda_ctx->fuse_plan_skipped, (unsigned long long) cuda_ctx->fuse_plan_probed);
                         }
                     }
                 }
