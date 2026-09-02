@@ -1479,14 +1479,21 @@ struct johnv8_q8_cache {
 // [johnv8] E10c: bufor na `lo` (wyjscie jadra A) niezalezny od alokatora grafu, zeby jadro B moglo je czytac
 // nawet gdy alokator nalozyl `mixed` na `lo`. Wazny tylko dla (lo, eval) zapisanych przez jadro A.
 struct johnv8_hcb_scratch {
-    char * buf = nullptr; size_t cap = 0; const ggml_tensor * lo = nullptr; uint64_t eval = 0;
-    float * ensure(size_t bytes) {
-        if (cap < bytes) {
+    char * buf = nullptr; size_t cap = 0;            // kopia lo (f32)
+    char * yq = nullptr; size_t yq_cap = 0;          // xn skwantyzowane (Q8_1)
+    char * yq2 = nullptr; size_t yq2_cap = 0;        // lo skwantyzowane (Q8_1)
+    char * counter = nullptr; size_t counter_cap = 0; // licznik "ostatni blok" (int, zerowany przez jadro)
+    const ggml_tensor * lo = nullptr; uint64_t eval = 0;
+    // stare bufory nie sa zwalniane (moga byc jeszcze czytane na strumieniu); rosna rzadko
+    void * ensure_buf(char ** b, size_t * c, size_t bytes, bool zero = false) {
+        if (*c < bytes) {
+            const size_t cap_new = bytes < ((size_t) 1 << 20) ? ((size_t) 1 << 20) : bytes;
             void * p = nullptr;
-            if (cudaMalloc(&p, bytes < ((size_t) 1 << 20) ? ((size_t) 1 << 20) : bytes) != cudaSuccess) { return nullptr; }
-            buf = (char *) p; cap = bytes < ((size_t) 1 << 20) ? ((size_t) 1 << 20) : bytes;   // stary bufor nie jest zwalniany (moze byc czytany)
+            if (cudaMalloc(&p, cap_new) != cudaSuccess) { return nullptr; }
+            if (zero) { cudaMemset(p, 0, cap_new); }
+            *b = (char *) p; *c = cap_new;
         }
-        return (float *) buf;
+        return *b;
     }
 };
 
