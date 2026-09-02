@@ -6357,6 +6357,29 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// [johnv8] E7: prolog GDN (sigmoid/softplus) w jadrze
+struct ggml_tensor * ggml_gated_delta_net_prolog(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * alpha_raw,
+        struct ggml_tensor  * beta_raw,
+        struct ggml_tensor  * state,
+        int64_t               K,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A) {
+    GGML_ASSERT(alpha_raw->ne[0] == 1);
+    GGML_ASSERT(dt->type == GGML_TYPE_F32 && A->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dt) && ggml_is_contiguous(A));
+    GGML_ASSERT(dt->ne[0] == v->ne[1] && A->ne[0] == v->ne[1]);
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, alpha_raw, beta_raw, state, K);
+    ggml_set_op_params_i32(result, 1, 1);
+    result->src[6] = dt;
+    result->src[7] = A;
+    return result;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(

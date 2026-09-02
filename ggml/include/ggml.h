@@ -2604,6 +2604,20 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // [johnv8] E7: jak wyzej, ale g = surowe alpha [1,H,T,B] i beta = surowe beta [1,H,T,B];
+    // jadro liczy samo beta=sigmoid(beta), g=softplus(alpha+dt)*A (dt, A: [H] f32).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_prolog(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * alpha_raw,
+            struct ggml_tensor  * beta_raw,
+            struct ggml_tensor  * state,
+            int64_t               K,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

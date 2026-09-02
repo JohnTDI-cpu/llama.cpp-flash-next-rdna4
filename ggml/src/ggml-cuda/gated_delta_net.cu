@@ -8,6 +8,8 @@ gated_delta_net_cuda(const float * q,
                                      const float * v,
                                      const float * g,
                                      const float * beta,
+                                     const float * pro_dt,
+                                     const float * pro_a,
                                      const float * curr_state,
                                      float *       dst,
                                      float *       state,
@@ -69,7 +71,10 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        float beta_val = *beta_t;
+        if (pro_dt != nullptr) {   // [johnv8] E7: sigmoid jak unary.cu
+            beta_val = 1.0f / (1.0f + expf(-beta_val));
+        }
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -82,7 +87,13 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            float g_raw = *g_t;
+            if (pro_dt != nullptr) {   // [johnv8] E7: softplus(alpha+dt)*A jak binbcast/unary.cu, bez kontrakcji FMA
+                const float ab = __fadd_rn(g_raw, pro_dt[h_idx]);
+                const float sp = (ab > 20.0f) ? ab : logf(1.0f + expf(ab));
+                g_raw = __fmul_rn(sp, pro_a[h_idx]);
+            }
+            const float g_val = expf(g_raw);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -169,7 +180,7 @@ gated_delta_net_cuda(const float * q,
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
-        const float * g_d, const float * b_d, const float * s_d,
+        const float * g_d, const float * b_d, const float * pro_dt, const float * pro_a, const float * s_d,
         float * dst_d, float * state_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
@@ -190,26 +201,26 @@ static void launch_gated_delta_net(
     switch (S_v) {
         case 16:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
@@ -254,6 +265,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * v_d = (const float *) src_v->data;
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
+    // [johnv8] E7: prolog w jadrze (src[6]=dt, src[7]=A, op_params[1]=1)
+    const bool    prolog = ggml_get_op_params_i32(dst, 1) != 0;
+    const float * pro_dt = prolog ? (const float *) dst->src[6]->data : nullptr;
+    const float * pro_a  = prolog ? (const float *) dst->src[7]->data : nullptr;
+    GGML_ASSERT(!prolog || src_g->ne[0] == 1);
 
     const float * s_d   = (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
@@ -296,21 +312,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     if (kda) {
         if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         }
     } else {
         if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         } else {
-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         }

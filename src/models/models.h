@@ -79,6 +79,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // [johnv8] E7: gdy ustawione, GDN dostaje surowe alpha/beta i liczy prolog w jadrze
+    ggml_tensor * gdn_prolog_dt = nullptr;
+    ggml_tensor * gdn_prolog_a  = nullptr;
+    void gdn_prolog_materialize(ggml_tensor *& g, ggml_tensor *& b);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(

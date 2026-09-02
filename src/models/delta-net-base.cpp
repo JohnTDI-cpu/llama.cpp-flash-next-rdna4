@@ -399,7 +399,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    ggml_tensor * result = gdn_prolog_dt
+        ? ggml_gated_delta_net_prolog(ctx0, q, k, v, g, b, s, /*K=*/1, gdn_prolog_dt, gdn_prolog_a)
+        : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -436,6 +438,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         if (cparams.fused_gdn_ar) {
             return build_delta_net_fused(q, k, v, g, b, s, il);
         }
+        gdn_prolog_materialize(g, b);
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }
 
@@ -443,7 +446,20 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         return build_delta_net_fused(q, k, v, g, b, s, il);
     }
 
+    gdn_prolog_materialize(g, b);
     return build_delta_net_chunking(q, k, v, g, b, s, il);
+}
+
+// [johnv8] E7: sciezki bez fuzji dostaja prolog policzony jawnie (jak dotad w grafie)
+void llm_build_delta_net_base::gdn_prolog_materialize(ggml_tensor *& g, ggml_tensor *& b) {
+    if (gdn_prolog_dt == nullptr) {
+        return;
+    }
+    const int64_t H = g->ne[1], T = g->ne[2], B = g->ne[3];
+    ggml_tensor * a3 = ggml_reshape_3d(ctx0, g, H, T, B);
+    a3 = ggml_mul(ctx0, ggml_softplus(ctx0, ggml_add(ctx0, a3, gdn_prolog_dt)), gdn_prolog_a);
+    g  = ggml_reshape_4d(ctx0, a3, 1, H, T, B);
+    b  = ggml_sigmoid(ctx0, b);
 }
 
 ggml_tensor * llm_build_delta_net_base::build_conv_state(
@@ -564,7 +580,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t K = cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = gdn_prolog_dt
+        ? ggml_gated_delta_net_prolog(ctx0, q, k, v, g, b, s, K, gdn_prolog_dt, gdn_prolog_a)
+        : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
