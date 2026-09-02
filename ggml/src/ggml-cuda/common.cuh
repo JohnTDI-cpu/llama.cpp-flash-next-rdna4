@@ -1476,8 +1476,23 @@ struct johnv8_q8_cache {
     }
 };
 
+// [johnv8] E10c: bufor na `lo` (wyjscie jadra A) niezalezny od alokatora grafu, zeby jadro B moglo je czytac
+// nawet gdy alokator nalozyl `mixed` na `lo`. Wazny tylko dla (lo, eval) zapisanych przez jadro A.
+struct johnv8_hcb_scratch {
+    char * buf = nullptr; size_t cap = 0; const ggml_tensor * lo = nullptr; uint64_t eval = 0;
+    float * ensure(size_t bytes) {
+        if (cap < bytes) {
+            void * p = nullptr;
+            if (cudaMalloc(&p, bytes < ((size_t) 1 << 20) ? ((size_t) 1 << 20) : bytes) != cudaSuccess) { return nullptr; }
+            buf = (char *) p; cap = bytes < ((size_t) 1 << 20) ? ((size_t) 1 << 20) : bytes;   // stary bufor nie jest zwalniany (moze byc czytany)
+        }
+        return (float *) buf;
+    }
+};
+
 struct ggml_backend_cuda_context {
     johnv8_q8_cache q8cache;   // [johnv8] E6d
+    johnv8_hcb_scratch hcb;    // [johnv8] E10c
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

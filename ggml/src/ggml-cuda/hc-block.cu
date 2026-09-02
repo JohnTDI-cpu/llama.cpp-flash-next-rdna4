@@ -34,6 +34,9 @@ static void hcb_dbg(const char * what, int step) {
     if (left > 0) { left--; fprintf(stderr, "[johnv8] hcblock_%s: odrzucone w kroku %d\n", what, step); }
 }
 #define HCB_REJECT(what, n) do { hcb_dbg(what, n); return false; } while (0)
+// rejestr: ostatni `lo` skopiowany przez jadro A do bufora kontekstu (ten sam watek wykonuje matcher B chwile pozniej)
+static thread_local const ggml_tensor * hcb_last_lo = nullptr;
+static thread_local bool hcb_last_lo_valid = false;
 
 // ---------------------------------------------------------------------------------------------
 // replika block_reduce<SUM, 1024> z common.cuh (warp_reduce_sum, s_sum[32], warp_reduce_sum)
@@ -82,6 +85,7 @@ hcblock_a_f32(const float * __restrict__ x,        // [n_embd, hc, nt]
               const void  * __restrict__ Wd,       // Q8_0 [hc_dim x R]: R wierszy po hc_dim
               float       * __restrict__ xn_out,   // [hc_dim, nt]
               float       * __restrict__ lo_out,   // [R, nt]
+              float       * __restrict__ lo_scr,   // kopia lo w buforze kontekstu (dla jadra B)
               const int n_embd, const int hc, const int R, const float eps,
               const float silu_scale, const float silu_bias) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -205,7 +209,9 @@ hcblock_a_f32(const float * __restrict__ x,        // [n_embd, hc, nt]
 #if defined(__AMDGCN__)
                     __asm__("" : "+v"(s));
 #endif
-                    lo_out[(int64_t) j * R + row0 + i] = s / (1.0f + expf(-s));
+                    const float sv = s / (1.0f + expf(-s));
+                    lo_out[(int64_t) j * R + row0 + i] = sv;
+                    lo_scr[(int64_t) j * R + row0 + i] = sv;
                 }
             }
         }
@@ -433,13 +439,15 @@ bool ggml_cuda_hcblock_b_ok(const ggml_cgraph * cgraph, int node_idx, int * n_ex
         if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_nodes, ops.data(), &out, 1)) { HCB_REJECT("b", 14); }
     }
     // dst (scale) nie moze nachodzic na lo/xn/Wu (lo bywa martwe po mm -> alokator moglby je nalozyc; model pinuje lo jako output)
-    if (hcb_overlap(scl, lo) || hcb_overlap(scl, xn) || hcb_overlap(scl, Wu)) { HCB_REJECT("b", 15); }
+    if (hcb_overlap(scl, xn) || hcb_overlap(scl, Wu)) { HCB_REJECT("b", 15); }
+    // lo: jesli jadro A zapisalo kopie do bufora kontekstu dla tego wlasnie tensora (i tego grafu), nakladanie mixed/lo nie szkodzi
+    if (hcb_overlap(scl, lo) && !(hcb_last_lo == lo && hcb_last_lo_valid)) { HCB_REJECT("b", 16); }
     *n_extra = n_mix;
     return true;
 }
 
 template <int ncols_dst>
-static void hcb_launch_a(ggml_backend_cuda_context & ctx, const float * x, const float * w, const void * Wd, float * xn, float * lo,
+static void hcb_launch_a(ggml_backend_cuda_context & ctx, const float * x, const float * w, const void * Wd, float * xn, float * lo, float * lo_scr,
                          int n_embd, int hc, int R, float eps, float s_scale, float s_bias) {
     int nwarps = 0, rows = 0;
     hcb_mmvq_cfg(ncols_dst, n_embd * hc, &nwarps, &rows);
@@ -450,7 +458,7 @@ static void hcb_launch_a(ggml_backend_cuda_context & ctx, const float * x, const
         const size_t smem = (size_t) ncols_dst * nblk * sizeof(block_q8_1) + (size_t) VB * (nw > 1 ? nw - 1 : 1) * ncols_dst * rw * 32 * sizeof(float) + (32 + ncols_dst * hc) * sizeof(float);
         const int grid = (R + VB * rw - 1) / (VB * rw);
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(HCB_THREADS, 1, 1), smem, ctx.stream());
-        ggml_cuda_kernel_launch(kern, lp, x, w, Wd, xn, lo, n_embd, hc, R, eps, s_scale, s_bias);
+        ggml_cuda_kernel_launch(kern, lp, x, w, Wd, xn, lo, lo_scr, n_embd, hc, R, eps, s_scale, s_bias);
     };
     if (nwarps == 4 && rows == 1)      { launch(hcblock_a_f32<ncols_dst, 4, 1>, 4, 1); }
     else if (nwarps == 2 && rows == 2) { launch(hcblock_a_f32<ncols_dst, 2, 2>, 2, 2); }
@@ -490,11 +498,14 @@ void ggml_cuda_op_hcblock_a(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     if (!logged && getenv("GGML_CUDA_DUMP_DISPATCH")) { logged = true; fprintf(stderr, "[johnv8] hcblock A fused: n_embd=%d hc=%d nt=%d R=%d (6 wezlow -> 1 jadro)\n", n_embd, hc, nt, R); }
     const float * x_d = (const float *) x->data; const float * w_d = (const float *) w->data;
     float * xn_d = (float *) mul->data; float * lo_d = (float *) silu->data;
+    float * lo_scr = ctx.hcb.ensure((size_t) R * nt * sizeof(float));
+    if (lo_scr == nullptr) { lo_scr = lo_d; ctx.hcb.lo = nullptr; hcb_last_lo = nullptr; hcb_last_lo_valid = false; }
+    else { ctx.hcb.lo = silu; ctx.hcb.eval = ctx.q8cache.eval; hcb_last_lo = silu; hcb_last_lo_valid = true; }
     switch (nt) {
-        case 1: hcb_launch_a<1>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, n_embd, hc, R, eps, s_scale, s_bias); break;
-        case 2: hcb_launch_a<2>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, n_embd, hc, R, eps, s_scale, s_bias); break;
-        case 3: hcb_launch_a<3>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, n_embd, hc, R, eps, s_scale, s_bias); break;
-        case 4: hcb_launch_a<4>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, n_embd, hc, R, eps, s_scale, s_bias); break;
+        case 1: hcb_launch_a<1>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, lo_scr, n_embd, hc, R, eps, s_scale, s_bias); break;
+        case 2: hcb_launch_a<2>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, lo_scr, n_embd, hc, R, eps, s_scale, s_bias); break;
+        case 3: hcb_launch_a<3>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, lo_scr, n_embd, hc, R, eps, s_scale, s_bias); break;
+        case 4: hcb_launch_a<4>(ctx, x_d, w_d, Wd->data, xn_d, lo_d, lo_scr, n_embd, hc, R, eps, s_scale, s_bias); break;
         default: GGML_ABORT("hcblock_a: nt=%d", nt);
     }
 }
@@ -509,6 +520,8 @@ void ggml_cuda_op_hcblock_b(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     static bool logged = false;
     if (!logged && getenv("GGML_CUDA_DUMP_DISPATCH")) { logged = true; fprintf(stderr, "[johnv8] hcblock B fused: n_embd=%d hc=%d nt=%d R=%d (%d wezlow -> 1 jadro)\n", n_embd, hc, nt, R, n_extra + 1); }
     const float * lo_d = (const float *) lo->data; const float * xn_d = (const float *) xn->data; float * mixed_d = (float *) scl->data;
+    if (ctx.hcb.lo == lo && ctx.hcb.eval == ctx.q8cache.eval && ctx.hcb.buf != nullptr) { lo_d = (const float *) ctx.hcb.buf; }
+    hcb_last_lo = nullptr; hcb_last_lo_valid = false;   // zuzyte
     switch (nt) {
         case 1: hcb_launch_b<1>(ctx, lo_d, Wu->data, xn_d, mixed_d, n_embd, hc, R, m_scale, m_bias); break;
         case 2: hcb_launch_b<2>(ctx, lo_d, Wu->data, xn_d, mixed_d, n_embd, hc, R, m_scale, m_bias); break;
