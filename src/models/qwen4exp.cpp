@@ -1285,8 +1285,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    // [johnv8] E7b: l2norm q/k liczony w jadrze GDN (GGML_JOHNV8_GDN_L2=0 przywraca osobne jadra)
+    static const bool gdn_l2 = []() { const char * e = getenv("GGML_JOHNV8_GDN_L2"); return e == nullptr || atoi(e) != 0; }();
+    const bool gdn_l2_in_kernel = gdn_l2 && gdn_prolog;
+    if (!gdn_l2_in_kernel) {
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
@@ -1301,9 +1306,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     gdn_prolog_dt = gdn_prolog ? model.layers[il].ssm_dt : nullptr;
     gdn_prolog_a  = gdn_prolog ? model.layers[il].ssm_a  : nullptr;
+    gdn_prolog_l2_eps = gdn_l2_in_kernel ? eps_norm : -1.0f;
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
     gdn_prolog_dt = nullptr;
     gdn_prolog_a  = nullptr;
+    gdn_prolog_l2_eps = -1.0f;
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 

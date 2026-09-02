@@ -10907,6 +10907,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const bool    prolog = ggml_get_op_params_i32(dst, 1) != 0;
     const float * pro_dt = prolog ? (const float *) dst->src[6]->data : nullptr;
     const float * pro_a  = prolog ? (const float *) dst->src[7]->data : nullptr;
+    // [johnv8] E7b: l2norm q/k w operatorze (op_params[3]=1, eps w op_params[2])
+    const bool  l2_on  = ggml_get_op_params_i32(dst, 3) != 0;
+    const float l2_eps = ggml_get_op_params_f32(dst, 2);
     ggml_tensor * src_state = dst->src[5];
 
     const int64_t S_v      = src_v->ne[0];
@@ -10995,6 +10998,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         for (int64_t t = 0; t < n_tokens; t++) {
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
+            float qn_buf[256];
+            float kn_buf[256];
+            if (l2_on) {   // [johnv8] E7b: jak ggml_compute_forward_l2_norm_f32
+                GGML_ASSERT(S_v <= 256);
+                ggml_float sq = 0.0, sk = 0.0;
+                for (int64_t i = 0; i < S_v; ++i) { sq += (ggml_float)(q_d[i] * q_d[i]); sk += (ggml_float)(k_d[i] * k_d[i]); }
+                const float scq = 1.0f/fmaxf(sqrtf(sq), l2_eps);
+                const float sck = 1.0f/fmaxf(sqrtf(sk), l2_eps);
+                for (int64_t i = 0; i < S_v; ++i) { qn_buf[i] = q_d[i] * scq; kn_buf[i] = k_d[i] * sck; }
+                q_d = qn_buf;
+                k_d = kn_buf;
+            }
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
 
             float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);

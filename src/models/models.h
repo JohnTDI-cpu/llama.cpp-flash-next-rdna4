@@ -82,7 +82,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // [johnv8] E7: gdy ustawione, GDN dostaje surowe alpha/beta i liczy prolog w jadrze
     ggml_tensor * gdn_prolog_dt = nullptr;
     ggml_tensor * gdn_prolog_a  = nullptr;
+    float         gdn_prolog_l2_eps = -1.0f;   // [johnv8] E7b: >= 0 -> l2norm q/k w jadrze
     void gdn_prolog_materialize(ggml_tensor *& g, ggml_tensor *& b);
+    void gdn_prolog_materialize_qk(ggml_tensor *& q, ggml_tensor *& k);
 
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)

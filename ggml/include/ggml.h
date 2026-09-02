@@ -2618,6 +2618,9 @@ extern "C" {
             struct ggml_tensor  * dt,
             struct ggml_tensor  * A);
 
+    // [johnv8] E7b: q i k normalizowane L2 (jak ggml_l2_norm, eps) wewnatrz jadra GDN
+    GGML_API void ggml_gated_delta_net_set_l2norm(struct ggml_tensor * gdn, float eps);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
