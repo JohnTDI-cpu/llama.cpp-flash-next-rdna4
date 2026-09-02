@@ -416,11 +416,10 @@ bool ggml_cuda_hc_combine_inject_ok(const ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_cuda_should_use_mmvf(GGML_TYPE_F32, cc, W->ne, W->nb, nt)) {
         { johnv8_inject_dbg(__LINE__); return false; }
     }
-    // wynik MUL_MAT i posrednie wezly nie moga byc uzywane poza lancuchem
-    const enum ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
-                                  cgraph->nodes[node_idx + 5]->op, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD };
-    const int32_t out_idx = node_idx + 8;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 9, ops, &out_idx, 1)) {
+    // wynik MUL_MAT uzywany tylko przez scale_in i nie jest wyjsciem grafu (reszte lancucha sprawdza
+    // ggml_cuda_hc_combine_ok + ggml_cuda_can_fuse w petli eval; ggml_can_fuse_subgraph odrzucalo przez
+    // view_src RESHAPE(block_out) spoza podgrafu — E30)
+    if (ggml_node_get_use_count(cgraph, node_idx) != 1 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         { johnv8_inject_dbg(__LINE__); return false; }
     }
     if (ggml_cuda_hc_overlap(add, W) || ggml_cuda_hc_overlap(add, hn)) {
