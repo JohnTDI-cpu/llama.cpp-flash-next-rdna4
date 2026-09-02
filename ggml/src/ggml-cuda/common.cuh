@@ -1413,6 +1413,17 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// [johnv8] mnozenie/dodawanie bez kontrakcji FMA — dokladnie jak osobne jadra binbcast (a*b, a+b).
+// UWAGA: NIE uzywac __fmul_rn/__fadd_rn: na HIP (gfx1201) daja inne bity niz zwykle a*b / a+b (test tail_variants: 15% roznic).
+static __device__ __forceinline__ float johnv8_mul_nc(const float a, const float b) {
+#pragma clang fp contract(off)
+    return a * b;
+}
+static __device__ __forceinline__ float johnv8_add_nc(const float a, const float b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+
 // [johnv8] E6d: pamiec podreczna kwantyzacji Q8_1 aktywacji (src1) dla mmvq.
 // Kilka matvecs z tym samym wejsciem (beta|alpha, gate_inp|shexp, indexer q|k) kwantyzuje raz.
 // Klucz: obiekt tensora + data + ne/nb + rozmiar, wazny tylko w biezacym graph_compute (eval).

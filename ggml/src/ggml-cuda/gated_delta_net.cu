@@ -100,8 +100,8 @@ gated_delta_net_cuda(const float * q,
             } else {        // wariant bez kontrakcji
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    tk = __fadd_rn(tk, __fmul_rn(k_reg[r], k_reg[r]));
-                    tq = __fadd_rn(tq, __fmul_rn(q_reg[r], q_reg[r]));
+                    tk = johnv8_add_nc(tk, johnv8_mul_nc(k_reg[r], k_reg[r]));
+                    tq = johnv8_add_nc(tq, johnv8_mul_nc(q_reg[r], q_reg[r]));
                 }
             }
             tk = warp_reduce_sum<warp_size>(tk);
@@ -110,17 +110,17 @@ gated_delta_net_cuda(const float * q,
             const float sq = rsqrtf(fmaxf(tq, l2_eps * l2_eps));
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                k_reg[r] = __fmul_rn(sk, k_reg[r]);
-                q_reg[r] = __fmul_rn(sq, q_reg[r]);
+                k_reg[r] = johnv8_mul_nc(sk, k_reg[r]);
+                q_reg[r] = johnv8_mul_nc(sq, q_reg[r]);
             }
         }
 
         if constexpr (!KDA) {
             float g_raw = *g_t;
             if (pro_dt != nullptr) {   // [johnv8] E7: softplus(alpha+dt)*A jak binbcast/unary.cu, bez kontrakcji FMA
-                const float ab = __fadd_rn(g_raw, pro_dt[h_idx]);
+                const float ab = johnv8_add_nc(g_raw, pro_dt[h_idx]);
                 const float sp = (ab > 20.0f) ? ab : logf(1.0f + expf(ab));
-                g_raw = __fmul_rn(sp, pro_a[h_idx]);
+                g_raw = johnv8_mul_nc(sp, pro_a[h_idx]);
             }
             const float g_val = expf(g_raw);
 

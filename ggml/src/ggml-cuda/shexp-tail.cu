@@ -12,7 +12,7 @@
 bool ggml_cuda_shexp_fuse_enabled() {
     static const bool v = []() {
         const char * e  = getenv("GGML_JOHNV8_SHEXP_FUSE");
-        const bool   on = (e != nullptr) && (atoi(e) != 0);   // domyslnie OFF: ROZNE tokeny vs stock (E16), do wyjasnienia
+        const bool   on = (e == nullptr) || (atoi(e) != 0);   // domyslnie ON (bit-exact po zamianie __fmul_rn/__fadd_rn na zwykle operatory)
         if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
             fprintf(stderr, "[johnv8] shexp_fuse = %d\n", (int) on);
         }
@@ -47,8 +47,8 @@ static __global__ void shexp_tail_f32(
 #endif
     const float sg = 1.0f / (1.0f + expf(-g));
     const int64_t id = (int64_t) i + (int64_t) n_embd*t;
-    const float m = __fmul_rn(shexp[id], sg);   // jak binbcast MUL, bez kontrakcji FMA
-    dst[id] = __fadd_rn(moe_out[id], m);  // jak binbcast ADD
+    const float m = shexp[id] * sg;      // jak binbcast MUL (pragma contract(off) w tym jadrze; bez __fmul_rn!)
+    dst[id] = moe_out[id] + m;           // jak binbcast ADD
 }
 
 static bool ggml_cuda_shexp_overlap(const ggml_tensor * a, const ggml_tensor * b) {
