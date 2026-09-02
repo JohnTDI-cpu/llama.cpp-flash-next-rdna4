@@ -923,7 +923,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // a maska rzadka rowna sie masce pelnej - wiec gesta uwaga daje ten sam wynik, a oszczedzamy
     // pooling, norme, rope, rzut q, score i top-k (~33 jader na warstwe). Klucze indeksera i tak
     // trafily do cache'u wyzej, wiec po przekroczeniu budzetu sciezka rzadka ma komplet.
-    if (n_kv <= (int64_t) hparams.indexer_top_k + r - 1) {
+    static const bool e3_on = []() { const char * e = getenv("GGML_JOHNV8_E3"); return e == nullptr || atoi(e) != 0; }();
+    if (e3_on && n_kv <= (int64_t) hparams.indexer_top_k + r - 1) {
         return nullptr;
     }
 
@@ -1513,7 +1514,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
         // E1 [johnv8]: ggml_cpy przyjmuje nieciagly widok wprost (jak delta-net-base.cpp); ggml_cont
         // kosztowal blit copyBufferRect + memcpy na kazdy slot i warstwe, bez zmiany wyniku.
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+        // E1 [johnv8]: cpy radzi sobie z nieciaglym zrodlem, ggml_cont bylo zbednym jadrem (GGML_JOHNV8_E1=0 przywraca)
+        static const bool e1_on = []() { const char * e = getenv("GGML_JOHNV8_E1"); return e == nullptr || atoi(e) != 0; }();
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, e1_on ? tail : ggml_cont(ctx0, tail), dst));
     }
 
     return conv_input;
