@@ -301,6 +301,23 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
+
+// [johnv8] Przelacznik optymalizacji grafu HC. GGML_JOHNV8_OPT to maska bitowa:
+//   bit 0 (1) - wyniesienie widokow przed lancuch add (odblokowuje fuzje multi-add)
+//   bit 1 (2) - RMS_NORM+MUL na tensorze 3D - WYLACZONE DOMYSLNIE: na upstreamie
+//               6c5afc86a zmienia wynik (rozjazd tokenow) i jest wolniejsze
+//               (24,45 vs 24,74 t/s). Zostawione do dalszego zbadania.
+// Domyslnie 1. GGML_JOHNV8_OPT=0 przywraca zachowanie stockowe.
+static int johnv8_opt() {
+    static const int v = []() {
+        const char * e = getenv("GGML_JOHNV8_OPT");
+        const int m = e ? atoi(e) : 1;
+        if (getenv("GGML_CUDA_DUMP_DISPATCH")) fprintf(stderr, "[johnv8] opt = %d\n", m);
+        return m;
+    }();
+    return v;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -315,9 +332,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
-    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    ggml_tensor * xn;
+    if (johnv8_opt() & 2) {
+        // [johnv8] waga jako [n_embd, hc, 1] -> rms_norm i mul sa kolejne i tego samego
+        // ksztaltu, wiec fuzja RMS_NORM+MUL sie lapie (wczesniej rozbijal ja wezel RESHAPE)
+        ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_norm, n_embd, hc, 1);
+        ggml_build_forward_expand(gf, w3);
+        xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+        xn = ggml_mul(ctx0, xn, w3);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    } else {
+        xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+        xn = ggml_mul(ctx0, xn, w_norm);
+    }
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -329,14 +357,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+    ggml_tensor * mixed;
+    if (johnv8_opt() & 1) {
+        // wszystkie widoki najpierw do grafu, potem sam lancuch add - wtedy wezly ADD
+        // maja kolejne indeksy i lapie sie fuzja multi-add (ggml-cuda.cu:3431)
+        GGML_ASSERT(hc >= 2 && hc <= 8);
+        ggml_tensor * v[8];
+        for (int64_t c = 0; c < hc; ++c) {
+            v[c] = ggml_view_2d(ctx0, gated, n_embd, nt,
+                    ggml_row_size(gated->type, n_embd) * hc,
+                    ggml_row_size(gated->type, n_embd) * c);
+            ggml_build_forward_expand(gf, v[c]);
+        }
+        mixed = ggml_add(ctx0, v[0], v[1]);
+        for (int64_t c = 2; c < hc; ++c) {
+            mixed = ggml_add(ctx0, mixed, v[c]);
+        }
+    } else {
+        mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+                ggml_row_size(gated->type, n_embd) * hc, 0);
+        mixed = ggml_cont(ctx0, mixed);
+        for (int64_t c = 1; c < hc; ++c) {
+            ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                    ggml_row_size(gated->type, n_embd) * hc,
+                    ggml_row_size(gated->type, n_embd) * c);
+            mixed = ggml_add(ctx0, mixed, s);
+        }
     }
     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     cb(mixed, "hc_mixed", il);

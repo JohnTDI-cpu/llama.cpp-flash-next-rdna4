@@ -394,6 +394,34 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// [johnv8] Macierze "chude" (male K, duze N) - np. hyper-connections qwen4exp
+// [320 -> 10240] - startuja blok na kazdy wiersz wyjscia, wiec blok czyta ~340 B
+// i konczy. Zmierzone 92 GB/s = 13% pasma. Mechanizm small_k istnieje w kodzie,
+// ale jest wylaczony dla calego RDNA. Domyslnie ON; GGML_CUDA_RDNA4_SMALL_K=0 wylacza.
+// [johnv8] Mnoznik progu small_k. Domyslnie 1 = zachowanie upstreamu.
+// Prog: blocks_per_row_x < nwarps * blocks_per_iter_1warp * mnoznik
+static int ggml_cuda_small_k_mult() {
+    static const int v = []() {
+        const char * e = getenv("GGML_JOHNV8_SMALLK_MULT");
+        const int m = e ? atoi(e) : 1;
+        if (getenv("GGML_CUDA_DUMP_DISPATCH")) fprintf(stderr, "[johnv8] smallk_mult = %d\n", m);
+        return m < 1 ? 1 : m;
+    }();
+    return v;
+}
+
+static bool ggml_cuda_rdna4_small_k() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_CUDA_RDNA4_SMALL_K");
+        const bool on = (e == nullptr) || (atoi(e) != 0);
+        if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
+            fprintf(stderr, "[johnv8] rdna4_small_k = %d\n", (int) on);
+        }
+        return on;
+    }();
+    return v;
+}
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
@@ -442,7 +470,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_IQ4_XS:
-                    return 8;
+                    return 4;   // [johnv8] zmierzone: 4 > 8 > 16 na gfx1201
                 default:
                     return 1;
             }
@@ -522,7 +550,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_RDNA4) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -1032,7 +1060,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
-        bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+        bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp * ggml_cuda_small_k_mult();
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
@@ -1058,7 +1086,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+                (GGML_CUDA_CC_IS_RDNA(cc) && !(GGML_CUDA_CC_IS_RDNA4(cc) && ggml_cuda_rdna4_small_k()))) {
             use = false;
         }
 
