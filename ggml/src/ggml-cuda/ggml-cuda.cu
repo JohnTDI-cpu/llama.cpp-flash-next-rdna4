@@ -27,6 +27,8 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/hc-combine.cuh"
+#include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -3282,6 +3284,33 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // [johnv8] qwen4exp build_hc_combine, patrz ggml-cuda/hc-combine.cu
+    std::initializer_list<enum ggml_op> hc_combine_ops = { GGML_OP_SCALE,   GGML_OP_UNARY,  GGML_OP_SCALE, GGML_OP_RESHAPE,
+                                                          GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_MUL,   GGML_OP_ADD };
+
+    if (is_equal(hc_combine_ops, ops)) {
+        if (!ggml_cuda_hc_fuse_enabled()) {
+            return false;
+        }
+
+        if (unary_ops.size() != 1 || unary_ops.begin()[0] != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+
+        // node_idx+4 to reshape tensora powstalego POZA podgrafem (block_out), wiec test
+        // view_src w ggml_can_fuse_subgraph_ext odrzucilby caly podgraf. Zgloszenie go jako
+        // wyjscia pomija ten test - to czysty widok, nic sie przez to nie materializuje.
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4, node_idx + 7 })) {
+            return false;
+        }
+
+        if (ggml_get_unary_op(cgraph->nodes[node_idx + 1]) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4178,6 +4207,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // [johnv8] qwen4exp build_hc_mix, patrz ggml-cuda/hc-mix.cu.
+    // MUSI byc sprawdzone PRZED fuzja unary+mul ponizej: kolaps zaczyna sie od tej samej pary
+    // UNARY(SIGMOID)+MUL, wiec krotszy wzorzec zabralby mu poczatek lancucha.
+    {
+        int hc_mix_nodes = 0;
+        // hc_mix_nodes > 1 to twardy warunek, nie kosmetyka: zwrocenie <= 0 cofa licznik
+        // petli ewaluacji i backend w kolko uruchamia ten sam wezel.
+        if (ggml_cuda_hc_mix_collapse_ok(cgraph, i, &hc_mix_nodes) && hc_mix_nodes > 1) {
+            ggml_cuda_op_hc_mix_collapse(*cuda_ctx, cgraph, i);
+            return hc_mix_nodes - 1;
+        }
+    }
+
+    // [johnv8] SCALE + UNARY(SILU) -> jedno jadro (hc_down w build_hc_mix)
+    if (ggml_cuda_scale_silu_ok(cgraph, i)) {
+        ggml_cuda_op_scale_silu(*cuda_ctx, cgraph, i);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -4188,6 +4236,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
         ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // [johnv8] diagnostyka: GGML_JOHNV8_HC_DEBUG=1 wypisuje realna sekwencje po kazdym SCALE
+    // [johnv8] musi byc sprawdzony PRZED softcapem - dluzszy wzorzec zaczyna sie tak samo
+    if ((ggml_cuda_can_fuse(cgraph, i,
+            { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
+              GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD },
+            { GGML_UNARY_OP_SIGMOID })
+         || ggml_cuda_can_fuse(cgraph, i,
+            { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
+              GGML_OP_VIEW,    GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD },
+            { GGML_UNARY_OP_SIGMOID }))
+        && ggml_cuda_hc_combine_ok(cgraph, i)) {
+        ggml_cuda_op_hc_combine(*cuda_ctx, cgraph, i);
+        return 7;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
@@ -4296,6 +4359,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // [johnv8-TMP] zrzut grafu: GGML_JOHNV8_GRAPH_DUMP=1 wypisuje pelna liste wezlow
+            // pierwszego grafu, a potem kazdy realny dispatch wraz z liczba wchlonietych wezlow.
+            // USUNAC po ustaleniu sekwencji.
+            static bool johnv8_dumped = false;
+            const bool  johnv8_dump   = getenv("GGML_JOHNV8_GRAPH_DUMP") && !johnv8_dumped;
+            int         johnv8_disp   = 0;
+            if (johnv8_dump) {
+                johnv8_dumped = true;
+                fprintf(stderr, "[johnv8-dump] n_nodes=%d\n", cgraph->n_nodes);
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const ggml_tensor * n = cgraph->nodes[i];
+                    fprintf(stderr, "[johnv8-node] %5d %-14s %-28s [%d,%d,%d,%d]%s\n",
+                            i, ggml_op_name(n->op), n->name,
+                            (int) n->ne[0], (int) n->ne[1], (int) n->ne[2], (int) n->ne[3],
+                            n->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(n)) : "");
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4340,6 +4421,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                // [johnv8-TMP] USUNAC razem z reszta zrzutu
+                if (johnv8_dump) {
+                    johnv8_disp++;
+                    fprintf(stderr, "[johnv8-disp] %5d %-14s %-28s +%d\n",
+                            i, ggml_op_name(node->op), node->name, nodes_to_skip);
+                }
+
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -4376,6 +4464,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+
+            // [johnv8-TMP] USUNAC razem z reszta zrzutu
+            if (johnv8_dump) {
+                fprintf(stderr, "[johnv8-dump] dispatchy=%d na %d wezlow\n", johnv8_disp, cgraph->n_nodes);
             }
         }
 

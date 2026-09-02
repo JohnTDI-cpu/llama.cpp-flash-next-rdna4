@@ -318,6 +318,36 @@ static int johnv8_opt() {
     return v;
 }
 
+// [johnv8] Wymuszenie kolejnosci wezlow w build_hc_combine, zeby caly lancuch
+//   SCALE -> SIGMOID -> SCALE -> RESHAPE -> RESHAPE -> REPEAT -> MUL -> ADD
+// lezal pod kolejnymi indeksami grafu i lapala sie fuzja w ggml/src/ggml-cuda/hc-combine.cu.
+// Ten sam przelacznik trzyma obie polowki patcha (graf + jadro) zgodnie: bez fuzji samo
+// wyniesienie reshape'ow nic nie daje. Domyslnie wlaczone, GGML_JOHNV8_HC_FUSE=0 wylacza.
+static bool johnv8_hc_fuse() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_JOHNV8_HC_FUSE");
+        const bool on = (e == nullptr) || (atoi(e) != 0);
+        if (getenv("GGML_CUDA_DUMP_DISPATCH")) fprintf(stderr, "[johnv8] hc_fuse (graf) = %d\n", (int) on);
+        return on;
+    }();
+    return v;
+}
+
+// [johnv8] Domkniecie lancucha kolapsu strumieni w build_hc_mix, zeby
+//   UNARY(SIGMOID) -> MUL -> RESHAPE -> hc x VIEW -> (hc-1) x ADD -> SCALE
+// lezalo pod kolejnymi indeksami grafu i lapala sie fuzja w ggml/src/ggml-cuda/hc-mix.cu.
+// Ten sam przelacznik trzyma obie polowki patcha (graf + jadro) zgodnie.
+// Domyslnie wlaczone, GGML_JOHNV8_MIX_FUSE=0 wylacza.
+static bool johnv8_mix_fuse() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_JOHNV8_MIX_FUSE");
+        const bool on = (e == nullptr) || (atoi(e) != 0);
+        if (getenv("GGML_CUDA_DUMP_DISPATCH")) fprintf(stderr, "[johnv8] mix_fuse (graf) = %d\n", (int) on);
+        return on;
+    }();
+    return v;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -387,6 +417,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     cb(mixed, "hc_mixed", il);
 
+    if (johnv8_mix_fuse()) {
+        // [johnv8] bez tego lancuch ADD/SCALE trafia do grafu dopiero przy rozwijaniu przez
+        // wywolujacego - a wtedy jego pozycja zalezy od tego, co wywolujacy robi z wynikiem.
+        // Domkniecie tutaj gwarantuje, ze ADD-y i SCALE sa tuz za widokami strumieni.
+        ggml_build_forward_expand(gf, mixed);
+    }
+
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
@@ -403,15 +440,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
+    if (johnv8_hc_fuse()) {
+        // [johnv8] NAJPIERW domknac block_out i residual - inaczej rozwiniecie 'b' wciaga
+        // caly ogon uwagi POMIEDZY lancuch w a repeat/mul/add i wzorzec sie rozjezdza
+        ggml_build_forward_expand(gf, block_out);
+        ggml_build_forward_expand(gf, residual);
+    }
+
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+    if (johnv8_hc_fuse()) {
+        // widoki najpierw do grafu - inaczej DFS wstawia REPEAT przed drugi SCALE
+        // i wezly nie leza pod kolejnymi indeksami (ggml_can_fuse_subgraph)
+        ggml_build_forward_expand(gf, w);
+    }
 
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+    if (johnv8_hc_fuse()) {
+        ggml_build_forward_expand(gf, b);
+    }
     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
 
     ggml_tensor * cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+    if (johnv8_hc_fuse()) {
+        // [johnv8] bez tego repeat/mul/add trafiaja do grafu dopiero przy rozwijaniu
+        // przez wywolujacego - czyli PO nastepnym bloku - i wzorzec fuzji sie rozjezdza
+        ggml_build_forward_expand(gf, cur);
+    }
     cb(cur, "hc_combine", il);
 
     return cur;
