@@ -10,10 +10,16 @@
 #define HCB_THREADS 1024
 #define HCB_MAX_NT  4
 
-bool ggml_cuda_hcblock_enabled() {
-    static const bool v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr || atoi(e) != 0; }();
+// GGML_JOHNV8_HCBLOCK: 0 = wylaczone, 1 = oba jadra (domyslnie), 2 = tylko A, 3 = tylko B (diagnostyka)
+static int ggml_cuda_hcblock_mode() {
+    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 1 : atoi(e); }();
     return v;
 }
+bool ggml_cuda_hcblock_enabled() {
+    return ggml_cuda_hcblock_mode() != 0;
+}
+static bool hcb_a_enabled() { const int m = ggml_cuda_hcblock_mode(); return m == 1 || m == 2; }
+static bool hcb_b_enabled() { const int m = ggml_cuda_hcblock_mode(); return m == 1 || m == 3; }
 // te same przelaczniki co mmvq.cu (sciezka small-K na RDNA4)
 static bool hcb_rdna4_small_k() {
     static const bool v = []() { const char * e = getenv("GGML_CUDA_RDNA4_SMALL_K"); return e == nullptr || atoi(e) != 0; }();
@@ -346,7 +352,7 @@ static void hcb_mmvq_cfg(const int ncols_dst, const int K, int * nwarps, int * r
 }
 
 bool ggml_cuda_hcblock_a_ok(const ggml_cgraph * cgraph, int node_idx) {
-    if (!ggml_cuda_hcblock_enabled()) { return false; }
+    if (!hcb_a_enabled()) { return false; }
     if (node_idx < 0 || node_idx + 5 >= cgraph->n_nodes) { return false; }
     const ggml_tensor * rms  = cgraph->nodes[node_idx + 0];
     const ggml_tensor * rs   = cgraph->nodes[node_idx + 1];
@@ -389,7 +395,7 @@ bool ggml_cuda_hcblock_a_ok(const ggml_cgraph * cgraph, int node_idx) {
 }
 
 bool ggml_cuda_hcblock_b_ok(const ggml_cgraph * cgraph, int node_idx, int * n_extra) {
-    if (!ggml_cuda_hcblock_enabled()) { return false; }
+    if (!hcb_b_enabled()) { return false; }
     if (node_idx < 0 || node_idx + 3 >= cgraph->n_nodes) { return false; }
     const ggml_tensor * mm = cgraph->nodes[node_idx];
     if (mm->op != GGML_OP_MUL_MAT) { return false; }
