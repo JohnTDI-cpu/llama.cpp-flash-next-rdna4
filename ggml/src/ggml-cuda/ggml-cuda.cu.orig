@@ -29,7 +29,6 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/hc-combine.cuh"
 #include "ggml-cuda/hc-mix.cuh"
-#include "ggml-cuda/conv-snap.cuh"
 #include "ggml-cuda/shexp-tail.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -4223,15 +4222,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
-    }
-
-    // [johnv8] E4: migawki stanu conv (n_slots x CPY -> 1 jadro), patrz ggml-cuda/conv-snap.cu
-    {
-        int snap_nodes = 0;
-        if (ggml_cuda_conv_snap_ok(cgraph, i, &snap_nodes) && snap_nodes > 1) {
-            ggml_cuda_op_conv_snap(*cuda_ctx, cgraph, i, snap_nodes);
-            return snap_nodes - 1;
-        }
     }
 
     // [johnv8] qwen4exp build_hc_mix, patrz ggml-cuda/hc-mix.cu.
