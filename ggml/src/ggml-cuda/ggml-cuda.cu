@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/hc-combine.cuh"
 #include "ggml-cuda/hc-mix.cuh"
+#include "ggml-cuda/shexp-tail.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -3284,6 +3285,21 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // [johnv8] E6b: ogon eksperta wspoldzielonego qwen4exp, patrz ggml-cuda/shexp-tail.cu
+    std::initializer_list<enum ggml_op> shexp_tail_ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+    if (is_equal(shexp_tail_ops, ops) && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID) {
+        if (!ggml_cuda_shexp_fuse_enabled()) {
+            return false;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        if (ggml_get_unary_op(cgraph->nodes[node_idx]) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+        return true;
+    }
+
     // [johnv8] qwen4exp build_hc_combine, patrz ggml-cuda/hc-combine.cu
     std::initializer_list<enum ggml_op> hc_combine_ops = { GGML_OP_SCALE,   GGML_OP_UNARY,  GGML_OP_SCALE, GGML_OP_RESHAPE,
                                                           GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_MUL,   GGML_OP_ADD };
@@ -4251,6 +4267,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         && ggml_cuda_hc_combine_ok(cgraph, i)) {
         ggml_cuda_op_hc_combine(*cuda_ctx, cgraph, i);
         return 7;
+    }
+
+    // [johnv8] E6b: sigmoid(gate) * shexp + moe_out -> jedno jadro
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { GGML_UNARY_OP_SIGMOID })
+        && ggml_cuda_shexp_tail_ok(cgraph, i)) {
+        ggml_cuda_op_shexp_tail(*cuda_ctx, cgraph, i);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
