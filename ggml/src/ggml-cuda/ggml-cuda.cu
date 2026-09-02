@@ -4477,7 +4477,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 static const bool johnv8_timing = getenv("GGML_JOHNV8_TIMING") != nullptr;
                 static int64_t johnv8_t_fuse = 0, johnv8_t_fwd = 0, johnv8_n_nodes = 0, johnv8_n_fused = 0, johnv8_n_graphs = 0;
                 const int64_t johnv8_t0 = johnv8_timing ? ggml_time_us() : 0;
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                // [johnv8] E11: plan fuzji — pomijamy matchery dla wezlow, ktore ostatnio nie fuzowaly (GGML_JOHNV8_PLAN_CACHE=1)
+                static const bool johnv8_plan_on = getenv("GGML_JOHNV8_PLAN_CACHE") != nullptr && atoi(getenv("GGML_JOHNV8_PLAN_CACHE")) != 0;
+                int nodes_to_skip = 0;
+                bool johnv8_plan_ok = false;
+                if (johnv8_plan_on) {
+                    auto & P = cuda_ctx->fuse_plan;
+                    if (i == 0) {
+                        P.graphs++;
+                        if (P.graph != cgraph || P.n_nodes != cgraph->n_nodes || (P.graphs % 2000) == 0) { P.reset(cgraph); }
+                    }
+                    if (P.n_nodes == cgraph->n_nodes && P.nodes[i] != node) { P.nodes[i] = node; P.skip[i] = 0; }
+                    johnv8_plan_ok = P.n_nodes == cgraph->n_nodes;
+                    if (johnv8_plan_ok && P.skip[i] == -1) {
+                        P.skipped++;
+                    } else {
+                        nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                        if (johnv8_plan_ok) { P.probed++; if (nodes_to_skip == 0) { P.skip[i] = -1; } }
+                    }
+                } else {
+                    nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                }
                 if (johnv8_timing) {
                     johnv8_t_fuse += ggml_time_us() - johnv8_t0;
                     johnv8_n_nodes++;
@@ -4485,10 +4505,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (i == 0) {
                         johnv8_n_graphs++;
                         if (johnv8_n_graphs % 400 == 0) {
-                            fprintf(stderr, "[johnv8-timing] grafy=%lld wezly/graf=%.0f fuzje/graf=%.0f try_fuse=%.2f us/wezel compute_forward=%.2f us/wezel razem=%.2f ms/graf\n",
+                            fprintf(stderr, "[johnv8-timing] grafy=%lld wezly/graf=%.0f fuzje/graf=%.0f try_fuse=%.2f us/wezel compute_forward=%.2f us/wezel razem=%.2f ms/graf plan: pominiete=%llu sprawdzone=%llu\n",
                                     (long long) johnv8_n_graphs, (double) johnv8_n_nodes / johnv8_n_graphs, (double) johnv8_n_fused / johnv8_n_graphs,
                                     (double) johnv8_t_fuse / johnv8_n_nodes, (double) johnv8_t_fwd / (johnv8_n_nodes - johnv8_n_fused + 1),
-                                    (double) (johnv8_t_fuse + johnv8_t_fwd) / johnv8_n_graphs / 1000.0);
+                                    (double) (johnv8_t_fuse + johnv8_t_fwd) / johnv8_n_graphs / 1000.0,
+                                    (unsigned long long) cuda_ctx->fuse_plan.skipped, (unsigned long long) cuda_ctx->fuse_plan.probed);
                         }
                     }
                 }

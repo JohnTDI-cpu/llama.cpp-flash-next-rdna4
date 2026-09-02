@@ -1490,7 +1490,19 @@ struct johnv8_hcb_scratch {
     }
 };
 
+// [johnv8] E11: pamiec podreczna NEGATYWNYCH decyzji fuzji per graf (graph reuse: te same wezly co token).
+// skip[i] == -1 -> dla tego wezla try_fuse zwrocil 0 -> nastepnym razem pomijamy matchery. Uniewaznienie: inny graf,
+// inna liczba wezlow, inny wskaznik wezla na pozycji i, oraz okresowo (co 2000 grafow) pelne odswiezenie.
+struct johnv8_fuse_plan {
+    const ggml_cgraph * graph = nullptr; int n_nodes = 0; uint64_t graphs = 0, skipped = 0, probed = 0;
+    std::vector<const ggml_tensor *> nodes; std::vector<int8_t> skip;
+    void reset(const ggml_cgraph * g) {
+        graph = g; n_nodes = g->n_nodes; nodes.assign(g->nodes, g->nodes + g->n_nodes); skip.assign(g->n_nodes, 0);
+    }
+};
+
 struct ggml_backend_cuda_context {
+    johnv8_fuse_plan fuse_plan; // [johnv8] E11
     johnv8_q8_cache q8cache;   // [johnv8] E6d
     johnv8_hcb_scratch hcb;    // [johnv8] E10c
     int device;
