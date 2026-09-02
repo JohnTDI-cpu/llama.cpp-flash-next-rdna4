@@ -912,6 +912,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
 
+    // E3 [johnv8]: QSA przycina kontekst dopiero powyzej budzetu indexer_top_k + r - 1 komorek.
+    // Gdy n_kv miesci sie w budzecie, top-k wybralby WSZYSTKIE komorki (ggml_top_k zwraca n_kv indeksow),
+    // a maska rzadka rowna sie masce pelnej - wiec gesta uwaga daje ten sam wynik, a oszczedzamy
+    // pooling, norme, rope, rzut q, score i top-k (~33 jader na warstwe). Klucze indeksera i tak
+    // trafily do cache'u wyzej, wiec po przekroczeniu budzetu sciezka rzadka ma komplet.
+    if (n_kv <= (int64_t) hparams.indexer_top_k + r - 1) {
+        return nullptr;
+    }
+
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
@@ -1485,7 +1494,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // E1 [johnv8]: ggml_cpy przyjmuje nieciagly widok wprost (jak delta-net-base.cpp); ggml_cont
+        // kosztowal blit copyBufferRect + memcpy na kazdy slot i warstwe, bez zmiany wyniku.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
