@@ -4473,7 +4473,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // [johnv8] pomiar czasu CPU petli eval (GGML_JOHNV8_TIMING=1): ile kosztuja matchery fuzji i compute_forward na wezel
+                static const bool johnv8_timing = getenv("GGML_JOHNV8_TIMING") != nullptr;
+                static int64_t johnv8_t_fuse = 0, johnv8_t_fwd = 0, johnv8_n_nodes = 0, johnv8_n_fused = 0, johnv8_n_graphs = 0;
+                const int64_t johnv8_t0 = johnv8_timing ? ggml_time_us() : 0;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (johnv8_timing) {
+                    johnv8_t_fuse += ggml_time_us() - johnv8_t0;
+                    johnv8_n_nodes++;
+                    if (nodes_to_skip != 0) { johnv8_n_fused++; }
+                    if (i == 0) {
+                        johnv8_n_graphs++;
+                        if (johnv8_n_graphs % 400 == 0) {
+                            fprintf(stderr, "[johnv8-timing] grafy=%lld wezly/graf=%.0f fuzje/graf=%.0f try_fuse=%.2f us/wezel compute_forward=%.2f us/wezel razem=%.2f ms/graf\n",
+                                    (long long) johnv8_n_graphs, (double) johnv8_n_nodes / johnv8_n_graphs, (double) johnv8_n_fused / johnv8_n_graphs,
+                                    (double) johnv8_t_fuse / johnv8_n_nodes, (double) johnv8_t_fwd / (johnv8_n_nodes - johnv8_n_fused + 1),
+                                    (double) (johnv8_t_fuse + johnv8_t_fwd) / johnv8_n_graphs / 1000.0);
+                        }
+                    }
+                }
 
                 // [johnv8-TMP] USUNAC razem z reszta zrzutu
                 if (johnv8_dump) {
@@ -4509,7 +4527,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                const int64_t johnv8_t1 = johnv8_timing ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (johnv8_timing) { johnv8_t_fwd += ggml_time_us() - johnv8_t1; }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
