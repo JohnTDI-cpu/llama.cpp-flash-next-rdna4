@@ -475,6 +475,21 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 1;
             }
         }
+        // [johnv8] Paczki weryfikacji MTP (ncols_dst 2-8): przemiecione 1=34,26 /
+        // 2=34,77 (tokeny identyczne) / 4=35,74 ale ROZJAZD tokenow (inna kolejnosc
+        // sumowania) -> zostaje 2. Stock zwracal 1, bo bez spekulacji ta sciezka
+        // prawie nie istnieje.
+        if (ncols_dst >= 2 && ncols_dst <= 8) {
+            switch (type) {
+                case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+                    return 2;
+                default:
+                    return 1;
+            }
+        }
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
