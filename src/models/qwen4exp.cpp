@@ -381,6 +381,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+    // [johnv8] E10c: jadro B czyta lo we wszystkich blokach, a alokator moglby nalozyc na nie wynik mix
+    // (lo jest martwe po hc_up w stocku) -> przypinamy lo, zeby nie bylo ponownie uzyte
+    static const bool hcblock_pin = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr || atoi(e) != 0; }();
+    if (hcblock_pin) {
+        ggml_set_output(lo);
+    }
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
     cb(gate, "hc_gate", il);
 

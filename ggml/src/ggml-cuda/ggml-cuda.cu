@@ -28,6 +28,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/hc-combine.cuh"
+#include "ggml-cuda/hc-block.cuh"
 #include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/conv-snap.cuh"
 #include "ggml-cuda/shexp-tail.cuh"
@@ -4278,6 +4279,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         && ggml_cuda_hc_combine_ok(cgraph, i)) {
         ggml_cuda_op_hc_combine(*cuda_ctx, cgraph, i);
         return 7;
+    }
+
+    // [johnv8] E10c: blok hc w dwoch jadrach (A: norm..silu, B: hc_up..mix)
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_hcblock_a_ok(cgraph, i)) {
+        ggml_cuda_op_hcblock_a(*cuda_ctx, cgraph, i);
+        return 5;
+    }
+    if (node->op == GGML_OP_MUL_MAT) {
+        int n_extra = 0;
+        if (ggml_cuda_hcblock_b_ok(cgraph, i, &n_extra)) {
+            ggml_cuda_op_hcblock_b(*cuda_ctx, cgraph, i, n_extra);
+            return n_extra;
+        }
     }
 
     // [johnv8] E10a: MUL_MAT(hc_inject) + lancuch combine (9 wezlow) -> jedno jadro
