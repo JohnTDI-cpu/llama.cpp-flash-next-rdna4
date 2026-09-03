@@ -1501,10 +1501,16 @@ struct johnv8_hcb_scratch {
 // skip[i] == -1 -> dla tego wezla try_fuse zwrocil 0 -> nastepnym razem pomijamy matchery. Uniewaznienie: inny graf,
 // inna liczba wezlow, inny wskaznik wezla na pozycji i, oraz okresowo (co 2000 grafow) pelne odswiezenie.
 struct johnv8_fuse_plan {
-    const ggml_cgraph * graph = nullptr; int n_nodes = 0; uint64_t graphs = 0, skipped = 0, probed = 0;
-    std::vector<const ggml_tensor *> nodes; std::vector<int8_t> skip;
+    // sygnatura wezla: ten sam adres tensora moze w innym grafie (prompt vs dekod) miec inne ksztalty/zrodla
+    struct sig { const ggml_tensor * t = nullptr; int op = 0; int64_t ne0 = 0, ne1 = 0, ne2 = 0, ne3 = 0; const ggml_tensor * s0 = nullptr; const ggml_tensor * s1 = nullptr; const void * data = nullptr;
+        static sig of(const ggml_tensor * n) { sig x; x.t = n; x.op = (int) n->op; x.ne0 = n->ne[0]; x.ne1 = n->ne[1]; x.ne2 = n->ne[2]; x.ne3 = n->ne[3]; x.s0 = n->src[0]; x.s1 = n->src[1]; x.data = n->data; return x; }
+        bool same(const ggml_tensor * n) const { return t == n && op == (int) n->op && ne0 == n->ne[0] && ne1 == n->ne[1] && ne2 == n->ne[2] && ne3 == n->ne[3] && s0 == n->src[0] && s1 == n->src[1] && data == n->data; }
+    };
+    const ggml_cgraph * graph = nullptr; int n_nodes = 0; uint64_t graphs = 0;
+    std::vector<sig> nodes; std::vector<int8_t> skip;
     void reset(const ggml_cgraph * g) {
-        graph = g; n_nodes = g->n_nodes; nodes.assign(g->nodes, g->nodes + g->n_nodes); skip.assign(g->n_nodes, 0);
+        graph = g; n_nodes = g->n_nodes; nodes.resize(g->n_nodes); skip.assign(g->n_nodes, 0);
+        for (int i = 0; i < g->n_nodes; ++i) { nodes[i] = sig::of(g->nodes[i]); }
     }
 };
 

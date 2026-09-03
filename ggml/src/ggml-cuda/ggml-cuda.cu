@@ -4490,7 +4490,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         if (cuda_ctx->fuse_plans.size() > 512) { cuda_ctx->fuse_plans.clear(); cuda_ctx->fuse_plan_cur = &cuda_ctx->fuse_plans[cgraph]; cuda_ctx->fuse_plan_cur->reset(cgraph); }
                     }
                     auto & P = *cuda_ctx->fuse_plan_cur;
-                    if (P.n_nodes == cgraph->n_nodes && P.nodes[i] != node) { P.nodes[i] = node; P.skip[i] = 0; }
+                    if (P.n_nodes == cgraph->n_nodes && !P.nodes[i].same(node)) { P.nodes[i] = johnv8_fuse_plan::sig::of(node); P.skip[i] = 0; }
                     johnv8_plan_ok = P.n_nodes == cgraph->n_nodes;
                     if (johnv8_plan_ok && P.skip[i] == -1) {
                         cuda_ctx->fuse_plan_skipped++;
