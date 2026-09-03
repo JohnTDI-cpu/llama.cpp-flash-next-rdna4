@@ -119,6 +119,8 @@ Jeśli `git am` odrzuci którąś łatkę (inna wersja bazy), użyj dokładnie c
 
 ### 4.3 Kompilacja
 
+Pełny build od zera trwa ~20–40 min na 16 wątkach (z ciepłym ccache — `GGML_CCACHE=ON` domyślnie — kilka minut).
+
 `johnv8/skrypty/buduj_hip.sh <katalog_drzewa> [wątki] [arch]` robi dokładnie to:
 
 ```bash
@@ -200,6 +202,8 @@ llama-server -m "$M" --host 127.0.0.1 --port 8092 \
 ## 6. Jak mierzyliśmy (żeby liczby były porównywalne)
 
 ### 6.1 Przepustowość: `bench_mtp.py`
+
+**Najpierw zatrzymaj każdy serwer używający tej karty** (np. launcher z §5) — benchmark i bramka same startują `llama-server`; przy zajętej karcie model się nie załaduje (skrypty wypisują wtedy ogon logu z `failed to load model`).
 
 Skrypt startuje `llama-server` z podanymi parametrami, buduje prompty przez `/tokenize` + `/detokenize` (długość dokładna, nie szacowana), mierzy prefill pp512/pp1024/pp2048 i dekod tg128 na dwóch promptach (proza, kod), powtarza, liczy medianę i zapisuje `bench_<ETYK>.json` + log serwera `bench_<ETYK>.log`. Sterowanie przez zmienne środowiskowe:
 

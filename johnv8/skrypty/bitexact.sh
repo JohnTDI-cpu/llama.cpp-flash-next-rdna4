@@ -7,10 +7,11 @@ ROCM=${ROCM_PATH:-/opt/rocm-7.2.4}; DEV=${DEV:-ROCm1}; CARD=${CARD:-card1}
 OT=${OT:-'per_layer_token_embd=CPU,blk\.(2[3-9]|3[0-9]|4[0-7])\.ffn_.*_exps=CPU'}; S=${SCRATCH:-/tmp/bitexact}; mkdir -p "$S"
 PK="Wyjasnij, jak powstaje tecza: po kolei, rzeczowo."
 PD="$(python3 -c "print(('Stacja pomiarowa: Krakow, temperatura 21,5 stopnia, wilgotnosc 48 procent, cisnienie 1013 hPa, wiatr 12 km/h. ' * 60) + 'Ktora z tych stacji ma najwyzsza temperature? Odpowiedz jednym zdaniem.')")"
+ss -ltn 2>/dev/null | grep -q "127.0.0.1:8097" && { echo "PRZERWANE: port 8097 zajety (inny serwer?)"; exit 1; }
 gen() {
   local BIN=$1 TAG=$2; shift 2
   env "$@" LD_LIBRARY_PATH=$BIN:$ROCM/lib ROCM_PATH=$ROCM GGML_CUDA_DISABLE_GRAPHS=1 "$BIN/llama-server" -m "$M" --host 127.0.0.1 --port 8097 --device $DEV -ngl 99 --fit off -ot "$OT" -c 8192 -np 1 --cache-type-k q8_0 --cache-type-v q8_0 -fa on -t 48 --no-warmup > /tmp/bitexact_$TAG.log 2>&1 &
-  local SV=$!; for i in $(seq 1 200); do curl -sf http://127.0.0.1:8097/health >/dev/null 2>&1 && break; kill -0 $SV 2>/dev/null || { echo "  $TAG: serwer padl"; return 1; }; sleep 2; done
+  local SV=$!; for i in $(seq 1 200); do curl -sf http://127.0.0.1:8097/health >/dev/null 2>&1 && break; kill -0 $SV 2>/dev/null || { echo "  $TAG: serwer padl - ogon logu /tmp/bitexact_$TAG.log:"; grep -aE " E |error|failed" /tmp/bitexact_$TAG.log | tail -3 | cut -c1-160 | sed "s/^/    /"; echo "    (najczestsza przyczyna: GPU $DEV zajete przez inny serwer - zatrzymaj go przed bramka)"; return 1; }; sleep 2; done
   for W in k d; do local P; [ $W = k ] && P="$PK" || P="$PD"
     python3 - "$P" "$S/gen_${TAG}_$W.txt" <<'PY'
 import sys,json,urllib.request

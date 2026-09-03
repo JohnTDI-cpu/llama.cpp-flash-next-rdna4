@@ -76,6 +76,10 @@ try:
             with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health",timeout=2) as r:
                 if r.status==200: break
         except Exception: time.sleep(2)
+    if p.poll() is not None:
+        print("  SERWER PADL przed health - ogon logu:", flush=True)
+        for ln in [l for l in open(LOG, errors="replace").read().splitlines() if " E " in l or "error" in l.lower() or "failed" in l.lower()][-3:]: print("    " + ln[:160], flush=True)
+        print("    (najczestsza przyczyna: GPU zajete przez inny serwer - zatrzymaj go przed benchmarkiem)", flush=True); sys.exit(3)
     po=vram(); d0=po.get("card0",0)-BAZA.get("card0",0)
     if d0>300 and not os.environ.get("GPU0_OK"): print(f"  ALARM: GPU0 urosl o {d0} MiB"); ubij(); sys.exit(2)
     print(f"  {ETYK} [{BACKEND} spec={SPEC}, {48-CPU_OD} warstw na CPU] VRAM card0 {po.get('card0',0)-BAZA.get('card0',0)} / card1 {po.get('card1',0)-BAZA.get('card1',0)} MiB, "
