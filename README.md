@@ -2,7 +2,7 @@
 
 ## About this work: a capability test of Claude Fable 5.1
 
-Everything in this fork beyond upstream llama.cpp and PR #28243 — the profiling, the kernel fusions, the MMQ tile cap, the experiments (E0–E66), the scripts, the benchmarks and this documentation — was developed autonomously by **Claude Fable 5.1** (Anthropic) running in Claude Code on the author's machine, on 2026-09-02/03. The author (JohnTDI-cpu) set the task as a test of what the model can do; by his account an earlier attempt at a comparable task with Claude Opus 5 did not succeed.
+Everything in this fork beyond upstream llama.cpp and PR #28243 — the profiling, the kernel fusions, the MMQ tile cap, the experiments (E0–E66), the scripts, the benchmarks and this documentation — was developed autonomously by **Claude Fable 5.1** (Anthropic) running in Claude Code on the author's machine, on 2026-09-02/03. The author (JohnTDI-cpu) set the task as a test of what the model can do; by his account earlier attempts at comparable tasks with Claude Opus 4.6, 4.8 and 5 gave poor results.
 
 **The task, as given:** profile the decode path of **Qwen3.8-Flash-Next (`qwen4exp`, UD-IQ3_XXS by unsloth)** on the HIP/ROCm backend and, based on the profile, improve decode throughput *significantly* — and prefill if possible — for two setups: **1× RDNA4 GPU + CPU** (one 32 GB Radeon AI PRO R9700 with part of the MoE experts on the CPU) and **2× RDNA4 GPU + CPU** (both R9700s, only the engram table on the CPU). Hard constraints: no loss of quality (every enabled change must be bit-exact with the stock kernels) and the model had to work from what was on the machine.
 
