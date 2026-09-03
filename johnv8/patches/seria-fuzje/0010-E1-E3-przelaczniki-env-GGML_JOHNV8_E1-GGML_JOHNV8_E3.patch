@@ -1,0 +1,39 @@
+From 2649d89dbfd4d67cd25b3793addded5059459506 Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 23:57:34 +0200
+Subject: [PATCH 10/34] E1/E3: przelaczniki env GGML_JOHNV8_E1 / GGML_JOHNV8_E3
+ do izolacji bit-exact
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/models/qwen4exp.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index de8beb9..ae913b8 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -923,7 +923,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // a maska rzadka rowna sie masce pelnej - wiec gesta uwaga daje ten sam wynik, a oszczedzamy
+     // pooling, norme, rope, rzut q, score i top-k (~33 jader na warstwe). Klucze indeksera i tak
+     // trafily do cache'u wyzej, wiec po przekroczeniu budzetu sciezka rzadka ma komplet.
+-    if (n_kv <= (int64_t) hparams.indexer_top_k + r - 1) {
++    static const bool e3_on = []() { const char * e = getenv("GGML_JOHNV8_E3"); return e == nullptr || atoi(e) != 0; }();
++    if (e3_on && n_kv <= (int64_t) hparams.indexer_top_k + r - 1) {
+         return nullptr;
+     }
+ 
+@@ -1513,7 +1514,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+ 
+         // E1 [johnv8]: ggml_cpy przyjmuje nieciagly widok wprost (jak delta-net-base.cpp); ggml_cont
+         // kosztowal blit copyBufferRect + memcpy na kazdy slot i warstwe, bez zmiany wyniku.
+-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
++        // E1 [johnv8]: cpy radzi sobie z nieciaglym zrodlem, ggml_cont bylo zbednym jadrem (GGML_JOHNV8_E1=0 przywraca)
++        static const bool e1_on = []() { const char * e = getenv("GGML_JOHNV8_E1"); return e == nullptr || atoi(e) != 0; }();
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, e1_on ? tail : ggml_cont(ctx0, tail), dst));
+     }
+ 
+     return conv_input;
+-- 
+2.43.0
+

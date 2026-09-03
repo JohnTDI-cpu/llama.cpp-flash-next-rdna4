@@ -1,0 +1,78 @@
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index c978b44..7cc4d5a 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -3,7 +3,9 @@
+ #include "common.cuh"
+ 
+ #include <climits>
++#include <cinttypes> // [johnv8] E55: PRId64
+ #include <cstdint>
++#include <cstdlib>   // [johnv8] E55: getenv/atoi
+ 
+ #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
+ #define MMQ_ITER_K             256
+@@ -1472,12 +1474,34 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+          ntx_fd);
+ }
+ 
++// [johnv8] E55: cap kafla kolumnowego J dla sciezki MoE (mul_mat_id).
++// Upstream wybiera J minimalizujace ceil(ncols_max/J), gdzie dla mul_mat_id ncols_max = ne12 (wszystkie tokeny
++// ubatcha, mmq.cu: args.ncols_max = ne12) -> J=128 (256 watkow, I=128 na RDNA4). Realna liczba wierszy per ekspert
++// to srednio ne12*n_used/n_expert (~10 dla 512 tokenow, 512 ekspertow, top-10). Blok jt=0 laduje wtedy pelny kafel
++// tile_y (J*MMQ_TILE_Y_K intow) i liczy vec_dot po calym J na kazdy krok K; maskowany (j > j_max) jest tylko write_back.
++// GGML_JOHNV8_MMQ_ID_JMAX=<n> (n > 0) ogranicza liczbe kolumn uzywana WYLACZNIE do wyboru J:
++//   ncols_sel = min(ncols_max, n)   (tylko gdy args.ids_dst != nullptr, tj. mul_mat_id)
++// Geometria launchu w launch_mul_mat_q (ntx = ceil(args.ncols_max/J), ntx_fd) zostaje po ncols_max, wiec ekspert
++// majacy > J wierszy dostaje kolejne bloki jt (kernel: `if (jt*J >= col_diff) return;` obcina puste kafle, a
++// write_back maskuje j > j_max = col_diff - jt*J - 1). Nieustawione lub 0 = zachowanie upstream.
++// Numeryka: kolejnosc akumulacji po K per element wyjscia nie zalezy od J/I (mmq-vec-dot.cuh: petla k01 jest
++// zewnetrzna, j0/n wewnetrzne, sum[...] += C.x[l]*dA*dB per k01; process_tile: kb0 rosnaco, k00 = 0 potem
++// MMQ_TILE_NE_K; K_vram = MMQ_ITER_K dla kazdego J na RDNA4) -> wynik bit-exact wzgledem J=128.
++static int ggml_cuda_mmq_id_jmax() {
++    static const int v = []() { const char * e = getenv("GGML_JOHNV8_MMQ_ID_JMAX"); return e == nullptr ? 0 : atoi(e); }();
++    return v;
++}
++
+ template <ggml_type type, bool fallback>
+ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     const int    id    = ggml_cuda_get_device();
+     const int    cc    = ggml_cuda_info().devices[id].cc;
+     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+ 
++    // [johnv8] E55: liczba kolumn brana pod uwage przy wyborze J (launch nadal po args.ncols_max).
++    const int jmax_id   = args.ids_dst != nullptr ? ggml_cuda_mmq_id_jmax() : 0;
++    const int64_t ncols_sel = (jmax_id > 0 && jmax_id < args.ncols_max) ? int64_t(jmax_id) : args.ncols_max;
++
+     int J_best        = 0;
+     int ntiles_J_best = INT_MAX;
+ 
+@@ -1491,7 +1515,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+             continue;
+         }
+ 
+-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
++        const int ntiles_x = (ncols_sel + config.J - 1) / config.J;
+ 
+         if (ntiles_x < ntiles_J_best) {
+             J_best = J;
+@@ -1499,6 +1523,19 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+         }
+     }
+ 
++    // [johnv8] E55: jednorazowa diagnostyka wybranego J (raz na instancje <type, fallback>) przy GGML_CUDA_DUMP_DISPATCH.
++    if (jmax_id > 0) {
++        static bool logged = false;
++        if (!logged && getenv("GGML_CUDA_DUMP_DISPATCH")) {
++            logged = true;
++            const ggml_cuda_mmq_config cfg = ggml_cuda_mmq_get_config(type, J_best, fallback, cc);
++            fprintf(stderr, "[johnv8] mmq_id J cap: type=%s fallback=%d ncols_max=%" PRId64 " jmax=%d ncols_sel=%" PRId64
++                    " -> J=%d (I=%d, nthreads=%d, ntx=%" PRId64 ")\n",
++                    ggml_type_name(type), int(fallback), args.ncols_max, jmax_id, ncols_sel,
++                    J_best, cfg.I, cfg.nthreads, (args.ncols_max + J_best - 1) / J_best);
++        }
++    }
++
+     switch (J_best) {
+         case   8:
+             launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);

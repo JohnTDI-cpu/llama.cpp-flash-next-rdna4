@@ -1,0 +1,99 @@
+From 061a95a418561550b5568575465c8a34054a132b Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 00:31:07 +0200
+Subject: [PATCH 17/34] Bez __fmul_rn/__fadd_rn (na HIP inne bity):
+ johnv8_mul_nc/add_nc z pragma contract(off); E6b znow domyslnie ON
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh         | 11 +++++++++++
+ ggml/src/ggml-cuda/gated_delta_net.cu | 12 ++++++------
+ ggml/src/ggml-cuda/shexp-tail.cu      |  6 +++---
+ 3 files changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 6b0c643..35e465f 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1413,6 +1413,17 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++// [johnv8] mnozenie/dodawanie bez kontrakcji FMA — dokladnie jak osobne jadra binbcast (a*b, a+b).
++// UWAGA: NIE uzywac __fmul_rn/__fadd_rn: na HIP (gfx1201) daja inne bity niz zwykle a*b / a+b (test tail_variants: 15% roznic).
++static __device__ __forceinline__ float johnv8_mul_nc(const float a, const float b) {
++#pragma clang fp contract(off)
++    return a * b;
++}
++static __device__ __forceinline__ float johnv8_add_nc(const float a, const float b) {
++#pragma clang fp contract(off)
++    return a + b;
++}
++
+ // [johnv8] E6d: pamiec podreczna kwantyzacji Q8_1 aktywacji (src1) dla mmvq.
+ // Kilka matvecs z tym samym wejsciem (beta|alpha, gate_inp|shexp, indexer q|k) kwantyzuje raz.
+ // Klucz: obiekt tensora + data + ne/nb + rozmiar, wazny tylko w biezacym graph_compute (eval).
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 98b419c..3c83ac4 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -100,8 +100,8 @@ gated_delta_net_cuda(const float * q,
+             } else {        // wariant bez kontrakcji
+ #pragma unroll
+                 for (int r = 0; r < rows_per_lane; r++) {
+-                    tk = __fadd_rn(tk, __fmul_rn(k_reg[r], k_reg[r]));
+-                    tq = __fadd_rn(tq, __fmul_rn(q_reg[r], q_reg[r]));
++                    tk = johnv8_add_nc(tk, johnv8_mul_nc(k_reg[r], k_reg[r]));
++                    tq = johnv8_add_nc(tq, johnv8_mul_nc(q_reg[r], q_reg[r]));
+                 }
+             }
+             tk = warp_reduce_sum<warp_size>(tk);
+@@ -110,17 +110,17 @@ gated_delta_net_cuda(const float * q,
+             const float sq = rsqrtf(fmaxf(tq, l2_eps * l2_eps));
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+-                k_reg[r] = __fmul_rn(sk, k_reg[r]);
+-                q_reg[r] = __fmul_rn(sq, q_reg[r]);
++                k_reg[r] = johnv8_mul_nc(sk, k_reg[r]);
++                q_reg[r] = johnv8_mul_nc(sq, q_reg[r]);
+             }
+         }
+ 
+         if constexpr (!KDA) {
+             float g_raw = *g_t;
+             if (pro_dt != nullptr) {   // [johnv8] E7: softplus(alpha+dt)*A jak binbcast/unary.cu, bez kontrakcji FMA
+-                const float ab = __fadd_rn(g_raw, pro_dt[h_idx]);
++                const float ab = johnv8_add_nc(g_raw, pro_dt[h_idx]);
+                 const float sp = (ab > 20.0f) ? ab : logf(1.0f + expf(ab));
+-                g_raw = __fmul_rn(sp, pro_a[h_idx]);
++                g_raw = johnv8_mul_nc(sp, pro_a[h_idx]);
+             }
+             const float g_val = expf(g_raw);
+ 
+diff --git a/ggml/src/ggml-cuda/shexp-tail.cu b/ggml/src/ggml-cuda/shexp-tail.cu
+index 5827fd1..4d198b8 100644
+--- a/ggml/src/ggml-cuda/shexp-tail.cu
++++ b/ggml/src/ggml-cuda/shexp-tail.cu
+@@ -12,7 +12,7 @@
+ bool ggml_cuda_shexp_fuse_enabled() {
+     static const bool v = []() {
+         const char * e  = getenv("GGML_JOHNV8_SHEXP_FUSE");
+-        const bool   on = (e != nullptr) && (atoi(e) != 0);   // domyslnie OFF: ROZNE tokeny vs stock (E16), do wyjasnienia
++        const bool   on = (e == nullptr) || (atoi(e) != 0);   // domyslnie ON (bit-exact po zamianie __fmul_rn/__fadd_rn na zwykle operatory)
+         if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
+             fprintf(stderr, "[johnv8] shexp_fuse = %d\n", (int) on);
+         }
+@@ -47,8 +47,8 @@ static __global__ void shexp_tail_f32(
+ #endif
+     const float sg = 1.0f / (1.0f + expf(-g));
+     const int64_t id = (int64_t) i + (int64_t) n_embd*t;
+-    const float m = __fmul_rn(shexp[id], sg);   // jak binbcast MUL, bez kontrakcji FMA
+-    dst[id] = __fadd_rn(moe_out[id], m);  // jak binbcast ADD
++    const float m = shexp[id] * sg;      // jak binbcast MUL (pragma contract(off) w tym jadrze; bez __fmul_rn!)
++    dst[id] = moe_out[id] + m;           // jak binbcast ADD
+ }
+ 
+ static bool ggml_cuda_shexp_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+-- 
+2.43.0
+

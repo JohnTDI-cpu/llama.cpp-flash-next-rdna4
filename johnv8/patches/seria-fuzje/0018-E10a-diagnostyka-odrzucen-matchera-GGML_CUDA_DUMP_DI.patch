@@ -1,0 +1,102 @@
+From a4a26419fc2cddb1819070c0a6fb7cf40a3bafeb Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 00:33:21 +0200
+Subject: [PATCH 18/34] E10a: diagnostyka odrzucen matchera
+ (GGML_CUDA_DUMP_DISPATCH)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/hc-combine.cu | 34 +++++++++++++++++++-------------
+ 1 file changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-combine.cu b/ggml/src/ggml-cuda/hc-combine.cu
+index 387900d..bac8830 100644
+--- a/ggml/src/ggml-cuda/hc-combine.cu
++++ b/ggml/src/ggml-cuda/hc-combine.cu
+@@ -362,28 +362,34 @@ static __global__ void hc_combine_inject_f32(
+     }
+ }
+ 
++// diagnostyka: GGML_CUDA_DUMP_DISPATCH=1 wypisuje, ktory warunek odrzucil fuzje E10a (max 40 razy)
++static void johnv8_inject_dbg(int step) {
++    static int left = getenv("GGML_CUDA_DUMP_DISPATCH") ? 40 : 0;
++    if (left > 0) { left--; fprintf(stderr, "[johnv8] hc_combine_inject_ok: odrzucone w kroku %d\n", step); }
++}
++
+ bool ggml_cuda_hc_combine_inject_ok(const ggml_cgraph * cgraph, int node_idx) {
+     if (!ggml_cuda_inject_fuse_enabled()) {
+-        return false;
++        { johnv8_inject_dbg(1); return false; }
+     }
+     if (node_idx < 0 || node_idx + 8 >= cgraph->n_nodes) {
+-        return false;
++        { johnv8_inject_dbg(2); return false; }
+     }
+     const ggml_tensor * mm = cgraph->nodes[node_idx];
+     if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32) {
+-        return false;
++        { johnv8_inject_dbg(3); return false; }
+     }
+     if (!ggml_cuda_hc_combine_ok(cgraph, node_idx + 1)) {
+-        return false;
++        { johnv8_inject_dbg(4); return false; }
+     }
+     const ggml_tensor * scale_in = cgraph->nodes[node_idx + 1];
+     if (scale_in->src[0] != mm) {
+-        return false;
++        { johnv8_inject_dbg(5); return false; }
+     }
+     const ggml_tensor * W  = mm->src[0];
+     const ggml_tensor * hn = mm->src[1];
+     if (!W || !hn || W->type != GGML_TYPE_F32 || hn->type != GGML_TYPE_F32) {
+-        return false;
++        { johnv8_inject_dbg(6); return false; }
+     }
+     const ggml_tensor * add = cgraph->nodes[node_idx + 8];
+     const int64_t n_embd = add->ne[0];
+@@ -391,34 +397,34 @@ bool ggml_cuda_hc_combine_inject_ok(const ggml_cgraph * cgraph, int node_idx) {
+     const int64_t nt     = add->ne[2];
+     const int64_t ncols  = n_embd * hc;
+     if (W->ne[0] != ncols || W->ne[1] != hc || W->ne[2] != 1 || W->ne[3] != 1) {
+-        return false;
++        { johnv8_inject_dbg(7); return false; }
+     }
+     if (hn->ne[0] != ncols || hn->ne[1] != nt || hn->ne[2] != 1 || hn->ne[3] != 1) {
+-        return false;
++        { johnv8_inject_dbg(8); return false; }
+     }
+     if (mm->ne[0] != hc || mm->ne[1] != nt || mm->ne[2] != 1 || mm->ne[3] != 1) {
+-        return false;
++        { johnv8_inject_dbg(9); return false; }
+     }
+     if (!ggml_is_contiguous(W) || !ggml_is_contiguous(hn) || !ggml_is_contiguous(mm)) {
+-        return false;
++        { johnv8_inject_dbg(10); return false; }
+     }
+     if (ncols % 2 != 0 || ncols > INT32_MAX || n_embd > INT32_MAX) {
+-        return false;
++        { johnv8_inject_dbg(11); return false; }
+     }
+     // stock liczy ten matmul przez mul_mat_vec_f (nt <= 8 na AMD) - replikujemy dokladnie te sciezke
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     if (!ggml_cuda_should_use_mmvf(GGML_TYPE_F32, cc, W->ne, W->nb, nt)) {
+-        return false;
++        { johnv8_inject_dbg(12); return false; }
+     }
+     // wynik MUL_MAT i posrednie wezly nie moga byc uzywane poza lancuchem
+     const enum ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
+                                   cgraph->nodes[node_idx + 5]->op, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD };
+     const int32_t out_idx = node_idx + 8;
+     if (!ggml_can_fuse_subgraph(cgraph, node_idx, 9, ops, &out_idx, 1)) {
+-        return false;
++        { johnv8_inject_dbg(13); return false; }
+     }
+     if (ggml_cuda_hc_overlap(add, W) || ggml_cuda_hc_overlap(add, hn)) {
+-        return false;
++        { johnv8_inject_dbg(14); return false; }
+     }
+     return true;
+ }
+-- 
+2.43.0
+

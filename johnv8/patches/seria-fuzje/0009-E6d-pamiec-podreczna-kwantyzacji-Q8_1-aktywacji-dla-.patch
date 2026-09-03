@@ -1,0 +1,142 @@
+From c45c196ca7deb3c65ef68094a6528ce0262fb99e Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 23:47:36 +0200
+Subject: [PATCH 09/34] E6d: pamiec podreczna kwantyzacji Q8_1 aktywacji dla
+ mmvq (jedno wejscie -> jedna kwantyzacja); env GGML_JOHNV8_Q8_DEDUP
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   | 48 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  2 ++
+ ggml/src/ggml-cuda/mmvq.cu      | 17 +++++++++---
+ 3 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 3ea72db..b4ac021 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -6,6 +6,7 @@
+ 
+ #include <cstdint>
+ #include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <mutex>
+ 
+@@ -1412,7 +1413,54 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++// [johnv8] E6d: pamiec podreczna kwantyzacji Q8_1 aktywacji (src1) dla mmvq.
++// Kilka matvecs z tym samym wejsciem (beta|alpha, gate_inp|shexp, indexer q|k) kwantyzuje raz.
++// Klucz: obiekt tensora + data + ne/nb + rozmiar, wazny tylko w biezacym graph_compute (eval).
++// Bit-exact: ponownie uzywany jest dokladnie ten sam wynik kwantyzacji.
++static inline bool johnv8_q8_dedup_enabled() {
++    static const bool v = []() { const char * e = getenv("GGML_JOHNV8_Q8_DEDUP"); return e == nullptr || atoi(e) != 0; }();
++    return v;
++}
++struct johnv8_q8_cache {
++    struct entry {
++        const ggml_tensor * t = nullptr; const void * data = nullptr;
++        int64_t ne[4] = {0,0,0,0}; size_t nb[4] = {0,0,0,0};
++        uint64_t eval = 0; size_t bytes = 0; char * buf = nullptr; size_t cap = 0;
++    };
++    static const int N = 6;
++    entry e[N]; int next = 0; uint64_t eval = 1; uint64_t hits = 0, misses = 0;
++    std::vector<char *> graveyard;
++    void bump() { eval++; }
++    void invalidate(const ggml_tensor * dst) {
++        const ggml_tensor * base = dst->view_src ? dst->view_src : dst;
++        for (auto & x : e) {
++            if (x.t != nullptr && (x.t == dst || x.t == base || (x.t->view_src != nullptr && x.t->view_src == base))) { x.t = nullptr; }
++        }
++    }
++    char * find(const ggml_tensor * t, size_t bytes) {
++        for (auto & x : e) {
++            if (x.t == t && x.eval == eval && x.data == t->data && x.bytes == bytes &&
++                memcmp(x.ne, t->ne, sizeof(x.ne)) == 0 && memcmp(x.nb, t->nb, sizeof(x.nb)) == 0) { hits++; return x.buf; }
++        }
++        misses++; return nullptr;
++    }
++    char * insert(const ggml_tensor * t, size_t bytes) {
++        entry & x = e[next]; next = (next + 1) % N;
++        if (x.cap < bytes) {
++            if (x.buf != nullptr) { graveyard.push_back(x.buf); }   // moze byc jeszcze czytany na strumieniu
++            const size_t cap = bytes > ((size_t) 1 << 20) ? bytes : ((size_t) 1 << 20);
++            void * ptr = nullptr;
++            if (cudaMalloc(&ptr, cap) != cudaSuccess) { x.buf = nullptr; x.cap = 0; x.t = nullptr; return nullptr; }
++            x.buf = (char *) ptr; x.cap = cap;
++        }
++        x.t = t; x.data = t->data; memcpy(x.ne, t->ne, sizeof(x.ne)); memcpy(x.nb, t->nb, sizeof(x.nb));
++        x.eval = eval; x.bytes = bytes;
++        return x.buf;
++    }
++};
++
+ struct ggml_backend_cuda_context {
++    johnv8_q8_cache q8cache;   // [johnv8] E6d
+     int device;
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4a993af..2ec1e16 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2063,6 +2063,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ }
+ 
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
++    if (johnv8_q8_dedup_enabled()) { ctx.q8cache.invalidate(dst); }   // [johnv8] E6d: zapis w miejsce uniewaznia wpis
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+             ggml_cuda_argmax(ctx, dst);
+@@ -4553,6 +4554,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
++    cuda_ctx->q8cache.bump();   // [johnv8] E6d: wpisy z poprzedniego grafu przestaja byc wazne
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 161a9cf..33c3ece 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1466,12 +1466,23 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++    const size_t  q8_bytes    = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
++    char * src1_q8_1 = nullptr;
+     {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        // [johnv8] E6d: to samo wejscie skwantyzowane w tym grafie -> uzyj ponownie (bit-exact)
++        const bool dedup = johnv8_q8_dedup_enabled();
++        char * cached = dedup ? ctx.q8cache.find(src1, q8_bytes) : nullptr;
++        if (cached != nullptr) {
++            src1_q8_1 = cached;
++        } else {
++            char * slot = dedup ? ctx.q8cache.insert(src1, q8_bytes) : nullptr;
++            src1_q8_1 = slot != nullptr ? slot : src1_q8_1_pool.alloc(q8_bytes);
++            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1497,7 +1508,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+-- 
+2.43.0
+

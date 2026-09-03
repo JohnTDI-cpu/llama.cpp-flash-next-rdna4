@@ -1,0 +1,1079 @@
+From 7462be18b1605b00d6c0a49cf6a9e9d35d64edcb Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 22:35:34 +0200
+Subject: [PATCH 04/34] fuzje hc-combine + hc-mix z forka (c689018e4,
+ f76552838)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu   |  93 ++++++
+ ggml/src/ggml-cuda/hc-combine.cu  | 269 +++++++++++++++++
+ ggml/src/ggml-cuda/hc-combine.cuh |  20 ++
+ ggml/src/ggml-cuda/hc-mix.cu      | 474 ++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/hc-mix.cuh     |  33 +++
+ src/models/qwen4exp.cpp           |  57 ++++
+ 6 files changed, 946 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/hc-combine.cu
+ create mode 100644 ggml/src/ggml-cuda/hc-combine.cuh
+ create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
+ create mode 100644 ggml/src/ggml-cuda/hc-mix.cuh
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 731fd00..2434968 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -27,6 +27,8 @@
+ #include "ggml-cuda/fattn.cuh"
+ #include "ggml-cuda/fwht.cuh"
+ #include "ggml-cuda/getrows.cuh"
++#include "ggml-cuda/hc-combine.cuh"
++#include "ggml-cuda/hc-mix.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
+ #include "ggml-cuda/mmq.cuh"
+@@ -3282,6 +3284,33 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         }
+     }
+ 
++    // [johnv8] qwen4exp build_hc_combine, patrz ggml-cuda/hc-combine.cu
++    std::initializer_list<enum ggml_op> hc_combine_ops = { GGML_OP_SCALE,   GGML_OP_UNARY,  GGML_OP_SCALE, GGML_OP_RESHAPE,
++                                                          GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_MUL,   GGML_OP_ADD };
++
++    if (is_equal(hc_combine_ops, ops)) {
++        if (!ggml_cuda_hc_fuse_enabled()) {
++            return false;
++        }
++
++        if (unary_ops.size() != 1 || unary_ops.begin()[0] != GGML_UNARY_OP_SIGMOID) {
++            return false;
++        }
++
++        // node_idx+4 to reshape tensora powstalego POZA podgrafem (block_out), wiec test
++        // view_src w ggml_can_fuse_subgraph_ext odrzucilby caly podgraf. Zgloszenie go jako
++        // wyjscia pomija ten test - to czysty widok, nic sie przez to nie materializuje.
++        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4, node_idx + 7 })) {
++            return false;
++        }
++
++        if (ggml_get_unary_op(cgraph->nodes[node_idx + 1]) != GGML_UNARY_OP_SIGMOID) {
++            return false;
++        }
++
++        return true;
++    }
++
+     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+         return false;
+     }
+@@ -4178,6 +4207,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    // [johnv8] qwen4exp build_hc_mix, patrz ggml-cuda/hc-mix.cu.
++    // MUSI byc sprawdzone PRZED fuzja unary+mul ponizej: kolaps zaczyna sie od tej samej pary
++    // UNARY(SIGMOID)+MUL, wiec krotszy wzorzec zabralby mu poczatek lancucha.
++    {
++        int hc_mix_nodes = 0;
++        // hc_mix_nodes > 1 to twardy warunek, nie kosmetyka: zwrocenie <= 0 cofa licznik
++        // petli ewaluacji i backend w kolko uruchamia ten sam wezel.
++        if (ggml_cuda_hc_mix_collapse_ok(cgraph, i, &hc_mix_nodes) && hc_mix_nodes > 1) {
++            ggml_cuda_op_hc_mix_collapse(*cuda_ctx, cgraph, i);
++            return hc_mix_nodes - 1;
++        }
++    }
++
++    // [johnv8] SCALE + UNARY(SILU) -> jedno jadro (hc_down w build_hc_mix)
++    if (ggml_cuda_scale_silu_ok(cgraph, i)) {
++        ggml_cuda_op_scale_silu(*cuda_ctx, cgraph, i);
++        return 1;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+@@ -4190,6 +4238,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    // [johnv8] diagnostyka: GGML_JOHNV8_HC_DEBUG=1 wypisuje realna sekwencje po kazdym SCALE
++    // [johnv8] musi byc sprawdzony PRZED softcapem - dluzszy wzorzec zaczyna sie tak samo
++    if ((ggml_cuda_can_fuse(cgraph, i,
++            { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
++              GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD },
++            { GGML_UNARY_OP_SIGMOID })
++         || ggml_cuda_can_fuse(cgraph, i,
++            { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
++              GGML_OP_VIEW,    GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD },
++            { GGML_UNARY_OP_SIGMOID }))
++        && ggml_cuda_hc_combine_ok(cgraph, i)) {
++        ggml_cuda_op_hc_combine(*cuda_ctx, cgraph, i);
++        return 7;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
+         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
+         return 2;
+@@ -4296,6 +4359,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            // [johnv8-TMP] zrzut grafu: GGML_JOHNV8_GRAPH_DUMP=1 wypisuje pelna liste wezlow
++            // pierwszego grafu, a potem kazdy realny dispatch wraz z liczba wchlonietych wezlow.
++            // USUNAC po ustaleniu sekwencji.
++            static bool johnv8_dumped = false;
++            const bool  johnv8_dump   = getenv("GGML_JOHNV8_GRAPH_DUMP") && !johnv8_dumped;
++            int         johnv8_disp   = 0;
++            if (johnv8_dump) {
++                johnv8_dumped = true;
++                fprintf(stderr, "[johnv8-dump] n_nodes=%d\n", cgraph->n_nodes);
++                for (int i = 0; i < cgraph->n_nodes; i++) {
++                    const ggml_tensor * n = cgraph->nodes[i];
++                    fprintf(stderr, "[johnv8-node] %5d %-14s %-28s [%d,%d,%d,%d]%s\n",
++                            i, ggml_op_name(n->op), n->name,
++                            (int) n->ne[0], (int) n->ne[1], (int) n->ne[2], (int) n->ne[3],
++                            n->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(n)) : "");
++                }
++            }
++
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+                 if (is_concurrent_event_active) {
+@@ -4340,6 +4421,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
++                // [johnv8-TMP] USUNAC razem z reszta zrzutu
++                if (johnv8_dump) {
++                    johnv8_disp++;
++                    fprintf(stderr, "[johnv8-disp] %5d %-14s %-28s +%d\n",
++                            i, ggml_op_name(node->op), node->name, nodes_to_skip);
++                }
++
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+@@ -4377,6 +4465,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     try_launch_concurrent_event(node);
+                }
+             }
++
++            // [johnv8-TMP] USUNAC razem z reszta zrzutu
++            if (johnv8_dump) {
++                fprintf(stderr, "[johnv8-dump] dispatchy=%d na %d wezlow\n", johnv8_disp, cgraph->n_nodes);
++            }
+         }
+ 
+ #ifdef USE_CUDA_GRAPH
+diff --git a/ggml/src/ggml-cuda/hc-combine.cu b/ggml/src/ggml-cuda/hc-combine.cu
+new file mode 100644
+index 0000000..1fd157f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-combine.cu
+@@ -0,0 +1,269 @@
++#include "hc-combine.cuh"
++
++#include "ggml-backend-impl.h"
++
++#include <cstdio>
++#include <cstdlib>
++
++// [johnv8] Fuzja lancucha qwen4exp build_hc_combine (src/models/qwen4exp.cpp) w jedno jadro.
++//
++// Stock generuje 6 jader na wywolanie (2 x na warstwe, 48 warstw = 576 uruchomien na token),
++// z czego dwa licza na hc=4 liczbach, a REPEAT materializuje n_embd*hc floatow tylko po to,
++// zeby rozmnozyc wektor.
++//
++// Bit-identycznosc: jadro powtarza *dokladnie* te same operacje f32 w tej samej kolejnosci co
++// sciezka stockowa (scale.cu: dst = scale*x + bias, unary.cu op_sigmoid: 1/(1+expf(-x)),
++// binbcast MUL, binbcast ADD). Kontrakcja mnozenia z dodawaniem jest wylaczona, bo stock liczy
++// (residual + round(b*w)) w dwoch osobnych jadrach i fma zmienialoby ostatnie zaokraglenie.
++
++bool ggml_cuda_hc_fuse_enabled() {
++    static const bool v = []() {
++        const char * e  = getenv("GGML_JOHNV8_HC_FUSE");
++        const bool   on = (e == nullptr) || (atoi(e) != 0);
++        if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
++            fprintf(stderr, "[johnv8] hc_fuse = %d\n", (int) on);
++        }
++        return on;
++    }();
++    return v;
++}
++
++static __global__ void hc_combine_f32(
++        const float * __restrict__ residual,
++        const float * __restrict__ block_out,
++        const float * __restrict__ inject,
++        float       * __restrict__ dst,
++        const float                scale_in,
++        const float                bias_in,
++        const float                scale_w,
++        const float                bias_w,
++        const int                  n_embd,
++        const int                  hc) {
++#if defined(__clang__)
++    // bez tego kompilator zwinalby `residual + b*w` w jedno fma i wynik przestalby byc
++    // bit-identyczny ze sciezka stockowa (osobne jadra MUL i ADD)
++#pragma clang fp contract(off)
++#endif
++    ggml_cuda_pdl_lc();
++
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    const int c = blockIdx.y;
++    const int t = blockIdx.z;
++
++    if (i >= n_embd) {
++        return;
++    }
++
++    ggml_cuda_pdl_sync();
++
++    // GGML_OP_SCALE -> GGML_UNARY_OP_SIGMOID -> GGML_OP_SCALE, wszystko na [hc, nt]
++    float in = inject[(int64_t) c + (int64_t) hc*t];
++#if defined(__AMDGCN__)
++    // adres inject nie zalezy od threadIdx, wiec kompilator scalaryzuje cala sigmoide na SALU
++    // (s_rndne_f32 ... v_s_exp_f32). Sekwencja arytmetyczna jest ta sama co w stocku, ale
++    // skalarny i wektorowy exp to osobne jednostki i nikt nie gwarantuje identycznych bitow.
++    // Przypiecie do VGPR wymusza dokladnie te sciezke, ktora liczy unary.cu (v_exp_f32).
++    __asm__("" : "+v"(in));
++#endif
++    const float s  = scale_in * in + bias_in;
++    const float sg = 1.0f / (1.0f + expf(-s));
++    const float w  = scale_w * sg + bias_w;
++
++    // GGML_OP_RESHAPE + GGML_OP_REPEAT: block_out[i, t] rozmnozony po hc
++    const int64_t ib = (int64_t) i + (int64_t) n_embd*t;
++    const int64_t id = (int64_t) i + (int64_t) n_embd*((int64_t) c + (int64_t) hc*t);
++
++    // GGML_OP_MUL, potem GGML_OP_ADD - dwa osobne zaokraglenia, jak w stocku
++    const float m = block_out[ib] * w;
++
++    dst[id] = residual[id] + m;
++}
++
++// czy dwa tensory dziela chocby bajt pamieci
++static bool ggml_cuda_hc_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a->buffer || !b->buffer) {
++        return true; // nie wiemy - zakladamy najgorsze
++    }
++
++    const char * a_start = (const char *) a->data;
++    const char * a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++
++    const char * b_start = (const char *) b->data;
++    const char * b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++
++    return (b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end);
++}
++
++bool ggml_cuda_hc_combine_ok(const ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_cuda_hc_fuse_enabled()) {
++        return false;
++    }
++
++    if (node_idx < 0 || node_idx + 7 >= cgraph->n_nodes) {
++        return false;
++    }
++
++    const ggml_tensor * scale_in = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * sigmoid  = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * scale_w  = cgraph->nodes[node_idx + 2];
++    const ggml_tensor * rs_w     = cgraph->nodes[node_idx + 3];
++    const ggml_tensor * rs_b     = cgraph->nodes[node_idx + 4];
++    const ggml_tensor * repeat   = cgraph->nodes[node_idx + 5];
++    const ggml_tensor * mul      = cgraph->nodes[node_idx + 6];
++    const ggml_tensor * add      = cgraph->nodes[node_idx + 7];
++
++    if (scale_in->op != GGML_OP_SCALE   || sigmoid->op != GGML_OP_UNARY  ||
++        scale_w->op  != GGML_OP_SCALE   || rs_w->op    != GGML_OP_RESHAPE ||
++        rs_b->op     != GGML_OP_RESHAPE || repeat->op  != GGML_OP_REPEAT  ||
++        mul->op      != GGML_OP_MUL     || add->op     != GGML_OP_ADD) {
++        return false;
++    }
++
++    if (ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID) {
++        return false;
++    }
++
++    // krawedzie: dokladnie ten ksztalt lancucha, ktory buduje build_hc_combine
++    if (sigmoid->src[0] != scale_in || scale_w->src[0] != sigmoid || rs_w->src[0] != scale_w) {
++        return false;
++    }
++    if (repeat->src[0] != rs_b) {
++        return false;
++    }
++    if (mul->src[0] != repeat || mul->src[1] != rs_w) {
++        return false;
++    }
++    // residual musi byc src0 dodawania, a wynik mnozenia src1
++    if (add->src[1] != mul || add->src[0] == mul) {
++        return false;
++    }
++
++    const ggml_tensor * inject    = scale_in->src[0];
++    const ggml_tensor * block_out = rs_b->src[0];
++    const ggml_tensor * residual  = add->src[0];
++
++    if (!inject || !block_out || !residual) {
++        return false;
++    }
++
++    // wszystko f32
++    const ggml_tensor * f32_nodes[] = { scale_in, sigmoid, scale_w, rs_w, rs_b, repeat, mul, add,
++                                        inject, block_out, residual };
++    for (const ggml_tensor * t : f32_nodes) {
++        if (t->type != GGML_TYPE_F32) {
++            return false;
++        }
++    }
++
++    const int64_t n_embd = add->ne[0];
++    const int64_t hc     = add->ne[1];
++    const int64_t nt     = add->ne[2];
++
++    if (n_embd <= 0 || hc <= 0 || nt <= 0 || add->ne[3] != 1) {
++        return false;
++    }
++
++    // siatka: y po hc, z po nt
++    if (hc > 65535 || nt > 65535) {
++        return false;
++    }
++
++    // ksztalty
++    if (!ggml_are_same_shape(add, residual) || !ggml_are_same_shape(add, mul) ||
++        !ggml_are_same_shape(mul, repeat)) {
++        return false;
++    }
++    if (inject->ne[0] != hc || inject->ne[1] != nt || inject->ne[2] != 1 || inject->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_are_same_shape(scale_in, inject) || !ggml_are_same_shape(sigmoid, inject) ||
++        !ggml_are_same_shape(scale_w, inject)) {
++        return false;
++    }
++    if (rs_w->ne[0] != 1 || rs_w->ne[1] != hc || rs_w->ne[2] != nt || rs_w->ne[3] != 1) {
++        return false;
++    }
++    if (block_out->ne[0] != n_embd || block_out->ne[1] != nt ||
++        block_out->ne[2] != 1      || block_out->ne[3] != 1) {
++        return false;
++    }
++    if (rs_b->ne[0] != n_embd || rs_b->ne[1] != 1 || rs_b->ne[2] != nt || rs_b->ne[3] != 1) {
++        return false;
++    }
++
++    // jadro indeksuje plaskie bufory
++    if (!ggml_is_contiguous(inject) || !ggml_is_contiguous(block_out) ||
++        !ggml_is_contiguous(residual) || !ggml_is_contiguous(add)) {
++        return false;
++    }
++
++    // parametry scale musza byc dokladnie te, ktore sklada build_hc_combine
++    if (ggml_get_op_params_f32(scale_in, 1) != 0.0f || ggml_get_op_params_f32(scale_w, 1) != 0.0f) {
++        return false;
++    }
++    if (ggml_get_op_params_f32(scale_in, 0) != 1.0f / (float) hc) {
++        return false;
++    }
++    if (ggml_get_op_params_f32(scale_w, 0) != 2.0f) {
++        return false;
++    }
++
++    // aliasowanie: kazdy element block_out i inject czyta hc (badz n_embd) watkow, wiec
++    // nadpisywanie ich wyjsciem byloby wyscigiem. residual jest czytany pod tym samym
++    // indeksem co zapis, wiec dokladny alias (add w miejscu) jest bezpieczny.
++    if (ggml_cuda_hc_overlap(add, block_out) || ggml_cuda_hc_overlap(add, inject)) {
++        return false;
++    }
++    if (add->data != residual->data && ggml_cuda_hc_overlap(add, residual)) {
++        return false;
++    }
++
++    return true;
++}
++
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * scale_in = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * scale_w  = cgraph->nodes[node_idx + 2];
++    const ggml_tensor * rs_b     = cgraph->nodes[node_idx + 4];
++    const ggml_tensor * add      = cgraph->nodes[node_idx + 7];
++
++    const ggml_tensor * inject    = scale_in->src[0];
++    const ggml_tensor * block_out = rs_b->src[0];
++    const ggml_tensor * residual  = add->src[0];
++
++    const int64_t n_embd = add->ne[0];
++    const int64_t hc     = add->ne[1];
++    const int64_t nt     = add->ne[2];
++
++    GGML_ASSERT(add->type == GGML_TYPE_F32);
++
++    const float s_in = ggml_get_op_params_f32(scale_in, 0);
++    const float b_in = ggml_get_op_params_f32(scale_in, 1);
++    const float s_w  = ggml_get_op_params_f32(scale_w,  0);
++    const float b_w  = ggml_get_op_params_f32(scale_w,  1);
++
++    if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            fprintf(stderr, "[johnv8] hc_combine fused: n_embd=%d hc=%d nt=%d (8 wezlow -> 1 jadro)\n",
++                    (int) n_embd, (int) hc, (int) nt);
++        }
++    }
++
++    const int64_t num_blocks_x = (n_embd + CUDA_HC_COMBINE_BLOCK_SIZE - 1) / CUDA_HC_COMBINE_BLOCK_SIZE;
++
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
++            dim3((unsigned int) num_blocks_x, (unsigned int) hc, (unsigned int) nt),
++            dim3(CUDA_HC_COMBINE_BLOCK_SIZE, 1, 1),
++            (size_t) 0,
++            ctx.stream());
++
++    ggml_cuda_kernel_launch(hc_combine_f32, launch_params,
++            (const float *) residual->data,
++            (const float *) block_out->data,
++            (const float *) inject->data,
++            (float *) add->data,
++            s_in, b_in, s_w, b_w,
++            (int) n_embd, (int) hc);
++}
+diff --git a/ggml/src/ggml-cuda/hc-combine.cuh b/ggml/src/ggml-cuda/hc-combine.cuh
+new file mode 100644
+index 0000000..a5d4290
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-combine.cuh
+@@ -0,0 +1,20 @@
++#include "common.cuh"
++#include "ggml.h"
++
++#define CUDA_HC_COMBINE_BLOCK_SIZE 256
++
++// [johnv8] Fuzja lancucha qwen4exp build_hc_combine w jedno jadro:
++//
++//   SCALE -> UNARY(SIGMOID) -> SCALE -> RESHAPE -> RESHAPE -> REPEAT -> MUL -> ADD
++//
++//   out[i, c, t] = residual[i, c, t] + block_out[i, t] * (2 / (1 + exp(-inject[c, t] / hc)))
++//
++// GGML_JOHNV8_HC_FUSE=0 wylacza fuzje (domyslnie wlaczona).
++
++// czy przelacznik pozwala na fuzje
++bool ggml_cuda_hc_fuse_enabled();
++
++// czy wezly cgraph->nodes[node_idx .. node_idx+7] to naprawde nasz przypadek
++bool ggml_cuda_hc_combine_ok(const ggml_cgraph * cgraph, int node_idx);
++
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+new file mode 100644
+index 0000000..ad37d6e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -0,0 +1,474 @@
++#include "hc-mix.cuh"
++
++#include "ggml-backend-impl.h"
++#include "ggml-impl.h"
++#include "scale.cuh"
++
++#include <cstdio>
++#include <cstdlib>
++
++// [johnv8] Fuzja lancuchow qwen4exp build_hc_mix (src/models/qwen4exp.cpp), ta sama recepta
++// co w hc-combine.cu. build_hc_mix jest wywolywana 97 razy na token (2 na warstwe x 48 + glowa),
++// wiec kazdy skasowany dispatch to ~97 uruchomien jadra mniej.
++//
++// Bit-identycznosc: jadra powtarzaja *dokladnie* te same operacje f32 w tej samej kolejnosci co
++// sciezka stockowa (unary.cu op_sigmoid: 1/(1+expf(-x)), unary.cuh op_silu: x/(1+expf(-x)),
++// binbcast MUL, binbcast ADD, scale.cu: dst = scale*x + bias). Kontrakcja mnozenia z dodawaniem
++// jest wylaczona, bo stock liczy kolejne zaokraglenia w osobnych jadrach.
++
++bool ggml_cuda_mix_fuse_enabled() {
++    static const bool v = []() {
++        const char * e  = getenv("GGML_JOHNV8_MIX_FUSE");
++        const bool   on = (e == nullptr) || (atoi(e) != 0);
++        if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
++            fprintf(stderr, "[johnv8] mix_fuse = %d\n", (int) on);
++        }
++        return on;
++    }();
++    return v;
++}
++
++// czy dwa tensory dziela chocby bajt pamieci
++static bool ggml_cuda_mix_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a->buffer || !b->buffer) {
++        return true; // nie wiemy - zakladamy najgorsze
++    }
++
++    const char * a_start = (const char *) a->data;
++    const char * a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++
++    const char * b_start = (const char *) b->data;
++    const char * b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++
++    return (b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end);
++}
++
++// ---------------------------------------------------------------------------------------------
++// 1) kolaps strumieni hyper-connections
++// ---------------------------------------------------------------------------------------------
++
++static __global__ void hc_mix_collapse_f32(
++        const float * __restrict__ xn,
++        const float * __restrict__ up,
++        float       * __restrict__ dst,
++        const float                scale,
++        const float                bias,
++        const int                  n_embd,
++        const int                  hc) {
++#if defined(__clang__)
++    // bez tego kompilator zwinalby `acc + xn*sigmoid(up)` w jedno fma i wynik przestalby byc
++    // bit-identyczny ze sciezka stockowa (osobne jadra MUL i ADD, kazde z wlasnym zaokragleniem)
++#pragma clang fp contract(off)
++#endif
++    ggml_cuda_pdl_lc();
++
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    const int t = blockIdx.y;
++
++    if (i >= n_embd) {
++        return;
++    }
++
++    ggml_cuda_pdl_sync();
++
++    // xn i up sa ciagle jako [n_embd*hc, nt]; widok strumienia c to offset n_embd*c
++    const int64_t base = (int64_t) i + (int64_t) n_embd*(int64_t) hc*(int64_t) t;
++
++    // GGML_UNARY_OP_SIGMOID + GGML_OP_MUL dla strumienia 0
++    float g0 = up[base];
++#if defined(__AMDGCN__)
++    // pilnujemy, zeby exp poszedl przez wektorowe v_exp_f32 (tak jak unary.cu), a nie zostal
++    // przez kompilator zeskalaryzowany na v_s_exp_f32 - to osobna jednostka i osobne bity
++    __asm__("" : "+v"(g0));
++#endif
++    float acc = xn[base] * (1.0f / (1.0f + expf(-g0)));
++
++    // lancuch GGML_OP_ADD: ((m0 + m1) + m2) + m3 - kolejnosc musi byc dokladnie taka jak
++    // w lancuchu ggml_add, zadnego sumowania "drzewkiem"
++    for (int c = 1; c < hc; ++c) {
++        const int64_t idx = base + (int64_t) n_embd*(int64_t) c;
++
++        float g = up[idx];
++#if defined(__AMDGCN__)
++        __asm__("" : "+v"(g));
++#endif
++        const float m = xn[idx] * (1.0f / (1.0f + expf(-g)));
++
++        acc = acc + m;
++    }
++
++    // GGML_OP_SCALE
++    dst[(int64_t) i + (int64_t) n_embd*(int64_t) t] = scale * acc + bias;
++}
++
++// wyciaga geometrie podgrafu; zwraca false gdy cokolwiek sie nie zgadza
++static bool hc_mix_collapse_match(const ggml_cgraph * cgraph, int node_idx, int * n_nodes_out,
++                                  const ggml_tensor ** xn_out, const ggml_tensor ** up_out) {
++    // minimalny prefiks: UNARY, MUL, RESHAPE
++    if (node_idx < 0 || node_idx + 2 >= cgraph->n_nodes) {
++        return false;
++    }
++
++    const ggml_tensor * sigmoid = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * mul     = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * rs      = cgraph->nodes[node_idx + 2];
++
++    if (sigmoid->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL) {
++        return false;
++    }
++    // reshape gated bywa RESHAPE albo VIEW, zaleznie od tego czy zrodlo bylo juz widokiem
++    if (rs->op != GGML_OP_RESHAPE && rs->op != GGML_OP_VIEW) {
++        return false;
++    }
++    if (ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID) {
++        return false;
++    }
++
++    // MUL musi czytac wyjscie sigmoidy; drugi operand to xn
++    const ggml_tensor * up = sigmoid->src[0];
++    const ggml_tensor * xn = nullptr;
++    if (mul->src[0] == sigmoid) {
++        xn = mul->src[1];
++    } else if (mul->src[1] == sigmoid) {
++        xn = mul->src[0];
++    } else {
++        return false;
++    }
++    if (!up || !xn) {
++        return false;
++    }
++
++    if (rs->src[0] != mul) {
++        return false;
++    }
++
++    const int64_t n_embd = rs->ne[0];
++    const int64_t hc     = rs->ne[1];
++    const int64_t nt     = rs->ne[2];
++
++    if (n_embd <= 0 || nt <= 0 || rs->ne[3] != 1) {
++        return false;
++    }
++    // hc widokow + (hc-1) dodawan - trzymamy sie zakresu, ktory buduje build_hc_mix
++    if (hc < 2 || hc > 8) {
++        return false;
++    }
++
++    // siatka: y po nt
++    if (nt > 65535) {
++        return false;
++    }
++
++    const int n_nodes = (int) (2*hc + 3);
++    if (node_idx + n_nodes > cgraph->n_nodes) {
++        return false;
++    }
++
++    const int idx_view = node_idx + 3;
++    const int idx_add  = idx_view + (int) hc;
++    const int idx_scl  = idx_add + (int) hc - 1;
++
++    const ggml_tensor * scl = cgraph->nodes[idx_scl];
++
++    // ksztalty i typy calego lancucha
++    if (sigmoid->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++        up->type      != GGML_TYPE_F32 || xn->type  != GGML_TYPE_F32 ||
++        scl->type     != GGML_TYPE_F32) {
++        return false;
++    }
++
++    const int64_t hc_dim = n_embd*hc;
++
++    // sigmoid, mul, xn, up: wszystko [hc_dim, nt] i ciagle - jadro indeksuje plaskie bufory
++    const ggml_tensor * flat[] = { sigmoid, mul, up, xn };
++    for (const ggml_tensor * f : flat) {
++        if (f->ne[0] != hc_dim || f->ne[1] != nt || f->ne[2] != 1 || f->ne[3] != 1) {
++            return false;
++        }
++        if (!ggml_is_contiguous(f)) {
++            return false;
++        }
++    }
++
++    // hc widokow strumieni: [n_embd, nt], krok wiersza n_embd*hc, offset n_embd*c
++    const size_t esz = sizeof(float);
++    for (int64_t c = 0; c < hc; ++c) {
++        const ggml_tensor * v = cgraph->nodes[idx_view + (int) c];
++
++        if (v->op != GGML_OP_VIEW || v->src[0] != rs || v->type != GGML_TYPE_F32) {
++            return false;
++        }
++        if (v->ne[0] != n_embd || v->ne[1] != nt || v->ne[2] != 1 || v->ne[3] != 1) {
++            return false;
++        }
++        if (v->nb[0] != esz || v->nb[1] != (size_t) hc_dim*esz) {
++            return false;
++        }
++        // widok musi lezec dokladnie tam, gdzie zaklada jadro
++        if ((const char *) v->data != (const char *) mul->data + (size_t) (n_embd*c)*esz) {
++            return false;
++        }
++    }
++
++    // lancuch dodawan: add[0] = v0 + v1, add[k] = add[k-1] + v[k+1]
++    for (int64_t k = 0; k + 1 < hc; ++k) {
++        const ggml_tensor * a = cgraph->nodes[idx_add + (int) k];
++
++        if (a->op != GGML_OP_ADD || a->type != GGML_TYPE_F32) {
++            return false;
++        }
++        if (a->ne[0] != n_embd || a->ne[1] != nt || a->ne[2] != 1 || a->ne[3] != 1) {
++            return false;
++        }
++
++        const ggml_tensor * lhs = (k == 0) ? cgraph->nodes[idx_view] : cgraph->nodes[idx_add + (int) k - 1];
++        const ggml_tensor * rhs = cgraph->nodes[idx_view + (int) k + 1];
++
++        if (a->src[0] != lhs || a->src[1] != rhs) {
++            return false;
++        }
++    }
++
++    // domykajacy SCALE
++    if (scl->op != GGML_OP_SCALE || scl->src[0] != cgraph->nodes[idx_scl - 1]) {
++        return false;
++    }
++    if (scl->ne[0] != n_embd || scl->ne[1] != nt || scl->ne[2] != 1 || scl->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_is_contiguous(scl)) {
++        return false;
++    }
++    // 1/hc, bez biasu. bias == 0 jest istotny: stock liczy scale*x+bias jednym v_fma_f32,
++    // a nasze jadro ma wylaczona kontrakcje - przy zerowym biasie oba daja te same bity.
++    if (ggml_get_op_params_f32(scl, 0) != 1.0f / (float) hc) {
++        return false;
++    }
++    if (ggml_get_op_params_f32(scl, 1) != 0.0f) {
++        return false;
++    }
++
++    // aliasowanie: kazdy element xn i up jest czytany raz, ale pod INNYM indeksem niz zapis
++    // (zwijamy hc strumieni w jeden), wiec jakiekolwiek nachodzenie wyjscia na wejscia
++    // byloby wyscigiem miedzy blokami
++    if (ggml_cuda_mix_overlap(scl, xn) || ggml_cuda_mix_overlap(scl, up)) {
++        return false;
++    }
++
++    *n_nodes_out = n_nodes;
++    *xn_out      = xn;
++    *up_out      = up;
++
++    return true;
++}
++
++bool ggml_cuda_hc_mix_collapse_ok(const ggml_cgraph * cgraph, int node_idx, int * n_nodes) {
++    if (!ggml_cuda_mix_fuse_enabled()) {
++        return false;
++    }
++
++    int                 n  = 0;
++    const ggml_tensor * xn = nullptr;
++    const ggml_tensor * up = nullptr;
++
++    if (!hc_mix_collapse_match(cgraph, node_idx, &n, &xn, &up)) {
++        return false;
++    }
++
++    // Sprawdzenie domkniecia podgrafu (liczba uzyc, flagi, lancuch view_src) robimy tym samym
++    // kodem co reszta backendu. Liste opow bierzemy z samych wezlow - dopasowanie opow zrobil
++    // juz hc_mix_collapse_match, a tutaj chodzi wylacznie o to, czy wyniki posrednie nie
++    // wyciekaja poza podgraf. Wyjsciem jest domykajacy SCALE.
++    enum ggml_op ops[32];
++    int          idxs[32];
++
++    GGML_ASSERT(n <= 32);
++
++    for (int k = 0; k < n; ++k) {
++        idxs[k] = node_idx + k;
++        ops[k]  = cgraph->nodes[node_idx + k]->op;
++    }
++
++    const int outputs[] = { node_idx + n - 1 };
++
++    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outputs, 1)) {
++        return false;
++    }
++
++    // UWAGA: bez tego przypisania wywolujacy dostawal n_nodes == 0 i liczyl
++    // "return n_nodes - 1" = -1, czyli petla ewaluacji cofala sie o wezel i w kolko
++    // uruchamiala to samo jadro. Zapisujemy dopiero na sciezce sukcesu.
++    *n_nodes = n;
++
++    return true;
++}
++
++void ggml_cuda_op_hc_mix_collapse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
++    int                 n  = 0;
++    const ggml_tensor * xn = nullptr;
++    const ggml_tensor * up = nullptr;
++
++    const bool ok = hc_mix_collapse_match(cgraph, node_idx, &n, &xn, &up);
++    GGML_ASSERT(ok);
++
++    const ggml_tensor * rs  = cgraph->nodes[node_idx + 2];
++    const ggml_tensor * scl = cgraph->nodes[node_idx + n - 1];
++
++    const int64_t n_embd = rs->ne[0];
++    const int64_t hc     = rs->ne[1];
++    const int64_t nt     = rs->ne[2];
++
++    const float scale = ggml_get_op_params_f32(scl, 0);
++    const float bias  = ggml_get_op_params_f32(scl, 1);
++
++    if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            fprintf(stderr, "[johnv8] hc_mix_collapse fused: n_embd=%d hc=%d nt=%d (%d wezlow -> 1 jadro)\n",
++                    (int) n_embd, (int) hc, (int) nt, n);
++        }
++    }
++
++    const int64_t num_blocks_x = (n_embd + CUDA_HC_MIX_BLOCK_SIZE - 1) / CUDA_HC_MIX_BLOCK_SIZE;
++
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
++            dim3((unsigned int) num_blocks_x, (unsigned int) nt, 1),
++            dim3(CUDA_HC_MIX_BLOCK_SIZE, 1, 1),
++            (size_t) 0,
++            ctx.stream());
++
++    ggml_cuda_kernel_launch(hc_mix_collapse_f32, launch_params,
++            (const float *) xn->data,
++            (const float *) up->data,
++            (float *) scl->data,
++            scale, bias,
++            (int) n_embd, (int) hc);
++}
++
++// ---------------------------------------------------------------------------------------------
++// 2) SCALE + UNARY(SILU)
++// ---------------------------------------------------------------------------------------------
++
++static __global__ void scale_silu_f32(
++        const float * __restrict__ x,
++        float       * __restrict__ dst,
++        const float                scale,
++        const float                bias,
++        const int64_t              nelements) {
++#if defined(__clang__)
++#pragma clang fp contract(off)
++#endif
++    ggml_cuda_pdl_lc();
++
++    const int64_t tid    = (int64_t) blockIdx.x*(int64_t) blockDim.x + (int64_t) threadIdx.x;
++    const int64_t stride = (int64_t) blockDim.x*(int64_t) gridDim.x;
++
++    ggml_cuda_pdl_sync();
++
++    for (int64_t i = tid; i < nelements; i += stride) {
++        // GGML_OP_SCALE (bias == 0, wiec fma i mul+add daja te same bity)
++        float s = scale * x[i] + bias;
++#if defined(__AMDGCN__)
++        // jak wyzej: wymuszamy wektorowy v_exp_f32
++        __asm__("" : "+v"(s));
++#endif
++        // GGML_UNARY_OP_SILU, unary.cuh ggml_cuda_op_silu_single
++        dst[i] = s / (1.0f + expf(-s));
++    }
++}
++
++bool ggml_cuda_scale_silu_ok(const ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_cuda_mix_fuse_enabled()) {
++        return false;
++    }
++
++    if (node_idx < 0 || node_idx + 1 >= cgraph->n_nodes) {
++        return false;
++    }
++
++    const ggml_tensor * scl  = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * silu = cgraph->nodes[node_idx + 1];
++
++    if (scl->op != GGML_OP_SCALE || silu->op != GGML_OP_UNARY) {
++        return false;
++    }
++    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU) {
++        return false;
++    }
++    if (silu->src[0] != scl) {
++        return false;
++    }
++
++    const ggml_tensor * src = scl->src[0];
++    if (!src) {
++        return false;
++    }
++
++    if (src->type != GGML_TYPE_F32 || scl->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
++        return false;
++    }
++
++    // scale.cu i unary.cu jada po plaskiej liscie elementow
++    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(silu)) {
++        return false;
++    }
++    if (!ggml_are_same_shape(src, scl) || !ggml_are_same_shape(scl, silu)) {
++        return false;
++    }
++
++    // bias != 0 wymagalby powtorzenia kontrakcji scale.cu (v_fma_f32); przy zerze nie ma roznicy
++    if (ggml_get_op_params_f32(scl, 1) != 0.0f) {
++        return false;
++    }
++
++    // pusty tensor dalby siatke o zerowej liczbie blokow
++    if (ggml_nelements(src) <= 0) {
++        return false;
++    }
++
++    // dst czytane i pisane pod tym samym indeksem, wiec dokladny alias jest bezpieczny;
++    // czesciowe nachodzenie juz nie
++    if (silu->data != src->data && ggml_cuda_mix_overlap(silu, src)) {
++        return false;
++    }
++
++    const enum ggml_op ops[]     = { GGML_OP_SCALE, GGML_OP_UNARY };
++    const int          idxs[]    = { node_idx, node_idx + 1 };
++    const int          outputs[] = { node_idx + 1 };
++
++    return ggml_can_fuse_subgraph_ext(cgraph, idxs, 2, ops, outputs, 1);
++}
++
++void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * scl  = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * silu = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * src  = scl->src[0];
++
++    const float scale = ggml_get_op_params_f32(scl, 0);
++    const float bias  = ggml_get_op_params_f32(scl, 1);
++
++    const int64_t nelements = ggml_nelements(src);
++
++    if (getenv("GGML_CUDA_DUMP_DISPATCH")) {
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            fprintf(stderr, "[johnv8] scale_silu fused: nelements=%d (2 wezly -> 1 jadro)\n", (int) nelements);
++        }
++    }
++
++    // taka sama siatka jak scale_f32_cuda, zeby kolejnosc elementow byla ta sama
++    const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
++
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
++            dim3((unsigned int) MIN((int64_t) 0x7FFFFFFF, num_blocks), 1, 1),
++            dim3(CUDA_SCALE_BLOCK_SIZE, 1, 1),
++            (size_t) 0,
++            ctx.stream());
++
++    ggml_cuda_kernel_launch(scale_silu_f32, launch_params,
++            (const float *) src->data,
++            (float *) silu->data,
++            scale, bias, nelements);
++}
+diff --git a/ggml/src/ggml-cuda/hc-mix.cuh b/ggml/src/ggml-cuda/hc-mix.cuh
+new file mode 100644
+index 0000000..6c7a20d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-mix.cuh
+@@ -0,0 +1,33 @@
++#include "common.cuh"
++#include "ggml.h"
++
++#define CUDA_HC_MIX_BLOCK_SIZE 256
++
++// [johnv8] Fuzja lancuchow qwen4exp build_hc_mix (src/models/qwen4exp.cpp).
++//
++// 1) kolaps strumieni hyper-connections - 2*hc+3 wezlow w jedno jadro:
++//
++//      UNARY(SIGMOID) -> MUL -> RESHAPE -> hc x VIEW -> (hc-1) x ADD -> SCALE
++//
++//      mixed[i, t] = (1/hc) * SUM_c ( xn[i + n_embd*c, t] * sigmoid(up[i + n_embd*c, t]) )
++//
++//    Sumowanie idzie DOKLADNIE w kolejnosci lancucha ADD: ((m0+m1)+m2)+m3.
++//    Tensor posredni `gated` (hc*n_embd*nt floatow) w ogole nie powstaje.
++//
++// 2) SCALE -> UNARY(SILU) w jedno jadro:  dst = silu(scale*x + bias), bias == 0
++//
++// GGML_JOHNV8_MIX_FUSE=0 wylacza obie fuzje (domyslnie wlaczone).
++
++// czy przelacznik pozwala na fuzje
++bool ggml_cuda_mix_fuse_enabled();
++
++// kolaps strumieni: czy wezly od node_idx to naprawde nasz przypadek.
++// Przy sukcesie *n_nodes dostaje dlugosc dopasowanego podgrafu (2*hc+3).
++bool ggml_cuda_hc_mix_collapse_ok(const ggml_cgraph * cgraph, int node_idx, int * n_nodes);
++
++void ggml_cuda_op_hc_mix_collapse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
++
++// SCALE + UNARY(SILU)
++bool ggml_cuda_scale_silu_ok(const ggml_cgraph * cgraph, int node_idx);
++
++void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 4d955a6..382b4ce 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -318,6 +318,36 @@ static int johnv8_opt() {
+     return v;
+ }
+ 
++// [johnv8] Wymuszenie kolejnosci wezlow w build_hc_combine, zeby caly lancuch
++//   SCALE -> SIGMOID -> SCALE -> RESHAPE -> RESHAPE -> REPEAT -> MUL -> ADD
++// lezal pod kolejnymi indeksami grafu i lapala sie fuzja w ggml/src/ggml-cuda/hc-combine.cu.
++// Ten sam przelacznik trzyma obie polowki patcha (graf + jadro) zgodnie: bez fuzji samo
++// wyniesienie reshape'ow nic nie daje. Domyslnie wlaczone, GGML_JOHNV8_HC_FUSE=0 wylacza.
++static bool johnv8_hc_fuse() {
++    static const bool v = []() {
++        const char * e = getenv("GGML_JOHNV8_HC_FUSE");
++        const bool on = (e == nullptr) || (atoi(e) != 0);
++        if (getenv("GGML_CUDA_DUMP_DISPATCH")) fprintf(stderr, "[johnv8] hc_fuse (graf) = %d\n", (int) on);
++        return on;
++    }();
++    return v;
++}
++
++// [johnv8] Domkniecie lancucha kolapsu strumieni w build_hc_mix, zeby
++//   UNARY(SIGMOID) -> MUL -> RESHAPE -> hc x VIEW -> (hc-1) x ADD -> SCALE
++// lezalo pod kolejnymi indeksami grafu i lapala sie fuzja w ggml/src/ggml-cuda/hc-mix.cu.
++// Ten sam przelacznik trzyma obie polowki patcha (graf + jadro) zgodnie.
++// Domyslnie wlaczone, GGML_JOHNV8_MIX_FUSE=0 wylacza.
++static bool johnv8_mix_fuse() {
++    static const bool v = []() {
++        const char * e = getenv("GGML_JOHNV8_MIX_FUSE");
++        const bool on = (e == nullptr) || (atoi(e) != 0);
++        if (getenv("GGML_CUDA_DUMP_DISPATCH")) fprintf(stderr, "[johnv8] mix_fuse (graf) = %d\n", (int) on);
++        return on;
++    }();
++    return v;
++}
++
+ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         ggml_tensor *  x,
+         ggml_tensor *  w_norm,
+@@ -387,6 +417,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+     cb(mixed, "hc_mixed", il);
+ 
++    if (johnv8_mix_fuse()) {
++        // [johnv8] bez tego lancuch ADD/SCALE trafia do grafu dopiero przy rozwijaniu przez
++        // wywolujacego - a wtedy jego pozycja zalezy od tego, co wywolujacy robi z wynikiem.
++        // Domkniecie tutaj gwarantuje, ze ADD-y i SCALE sa tuz za widokami strumieni.
++        ggml_build_forward_expand(gf, mixed);
++    }
++
+     if (inject) {
+         *inject = build_lora_mm(w_inject, xn);
+         cb(*inject, "hc_inject", il);
+@@ -403,15 +440,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     const int64_t hc = hparams.dsv4_hc_mult;
+     const int64_t nt = residual->ne[2];
+ 
++    if (johnv8_hc_fuse()) {
++        // [johnv8] NAJPIERW domknac block_out i residual - inaczej rozwiniecie 'b' wciaga
++        // caly ogon uwagi POMIEDZY lancuch w a repeat/mul/add i wzorzec sie rozjezdza
++        ggml_build_forward_expand(gf, block_out);
++        ggml_build_forward_expand(gf, residual);
++    }
++
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+     w = ggml_scale(ctx0, w, 2.0f);
+     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
++    if (johnv8_hc_fuse()) {
++        // widoki najpierw do grafu - inaczej DFS wstawia REPEAT przed drugi SCALE
++        // i wezly nie leza pod kolejnymi indeksami (ggml_can_fuse_subgraph)
++        ggml_build_forward_expand(gf, w);
++    }
+ 
+     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
++    if (johnv8_hc_fuse()) {
++        ggml_build_forward_expand(gf, b);
++    }
+     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+ 
+     ggml_tensor * cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
++    if (johnv8_hc_fuse()) {
++        // [johnv8] bez tego repeat/mul/add trafiaja do grafu dopiero przy rozwijaniu
++        // przez wywolujacego - czyli PO nastepnym bloku - i wzorzec fuzji sie rozjezdza
++        ggml_build_forward_expand(gf, cur);
++    }
+     cb(cur, "hc_combine", il);
+ 
+     return cur;
+-- 
+2.43.0
+

@@ -1,0 +1,73 @@
+From 8351ddc85ee10001a1dd43aa414630479cc93c76 Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 01:46:46 +0200
+Subject: [PATCH 29/34] =?UTF-8?q?E11:=20plan=20fuzji=20per=20split=20(mapa?=
+ =?UTF-8?q?=20po=20wskazniku=20cgraph)=20=E2=80=94=20poprzednio=20resetowa?=
+ =?UTF-8?q?ny=20przy=20kazdym=20splicie?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   |  5 ++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 11 +++++++----
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b92d8b1..9dae540 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1509,7 +1509,10 @@ struct johnv8_fuse_plan {
+ };
+ 
+ struct ggml_backend_cuda_context {
+-    johnv8_fuse_plan fuse_plan; // [johnv8] E11
++    // [johnv8] E11: plan per graf (scheduler wola graph_compute osobno dla kazdego splitu -> rozne wskazniki cgraph)
++    std::unordered_map<const ggml_cgraph *, johnv8_fuse_plan> fuse_plans;
++    johnv8_fuse_plan * fuse_plan_cur = nullptr;
++    uint64_t fuse_plan_skipped = 0, fuse_plan_probed = 0;
+     johnv8_q8_cache q8cache;   // [johnv8] E6d
+     johnv8_hcb_scratch hcb;    // [johnv8] E10c
+     int device;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d238ab1..23c481b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4482,18 +4482,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 int nodes_to_skip = 0;
+                 bool johnv8_plan_ok = false;
+                 if (johnv8_plan_on) {
+-                    auto & P = cuda_ctx->fuse_plan;
+                     if (i == 0) {
++                        auto & P = cuda_ctx->fuse_plans[cgraph];
++                        cuda_ctx->fuse_plan_cur = &P;
+                         P.graphs++;
+                         if (P.graph != cgraph || P.n_nodes != cgraph->n_nodes || (P.graphs % 2000) == 0) { P.reset(cgraph); }
++                        if (cuda_ctx->fuse_plans.size() > 512) { cuda_ctx->fuse_plans.clear(); cuda_ctx->fuse_plan_cur = &cuda_ctx->fuse_plans[cgraph]; cuda_ctx->fuse_plan_cur->reset(cgraph); }
+                     }
++                    auto & P = *cuda_ctx->fuse_plan_cur;
+                     if (P.n_nodes == cgraph->n_nodes && P.nodes[i] != node) { P.nodes[i] = node; P.skip[i] = 0; }
+                     johnv8_plan_ok = P.n_nodes == cgraph->n_nodes;
+                     if (johnv8_plan_ok && P.skip[i] == -1) {
+-                        P.skipped++;
++                        cuda_ctx->fuse_plan_skipped++;
+                     } else {
+                         nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+-                        if (johnv8_plan_ok) { P.probed++; if (nodes_to_skip == 0) { P.skip[i] = -1; } }
++                        if (johnv8_plan_ok) { cuda_ctx->fuse_plan_probed++; if (nodes_to_skip == 0) { P.skip[i] = -1; } }
+                     }
+                 } else {
+                     nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+@@ -4509,7 +4512,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                     (long long) johnv8_n_graphs, (double) johnv8_n_nodes / johnv8_n_graphs, (double) johnv8_n_fused / johnv8_n_graphs,
+                                     (double) johnv8_t_fuse / johnv8_n_nodes, (double) johnv8_t_fwd / (johnv8_n_nodes - johnv8_n_fused + 1),
+                                     (double) (johnv8_t_fuse + johnv8_t_fwd) / johnv8_n_graphs / 1000.0,
+-                                    (unsigned long long) cuda_ctx->fuse_plan.skipped, (unsigned long long) cuda_ctx->fuse_plan.probed);
++                                    (unsigned long long) cuda_ctx->fuse_plan_skipped, (unsigned long long) cuda_ctx->fuse_plan_probed);
+                         }
+                     }
+                 }
+-- 
+2.43.0
+

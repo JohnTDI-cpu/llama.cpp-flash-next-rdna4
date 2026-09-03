@@ -1,0 +1,775 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 548c80f..c6a80e7 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1172,6 +1172,42 @@ struct ggml_cuda_pool {
+     virtual void free(void * ptr, size_t size) = 0;
+ };
+ 
++// [johnv8] E64: any-order (launch bez bitu bariery AQL) z trackerem hazardow — patrz PLAN_ANYORDER.md.
++// Tracker trzyma zakresy bajtow zapisane/odczytane od ostatniego launchu barierowego na strumieniu 0;
++// wezel dostaje jednorazowy grant, gdy jego W nie tnie (written u read), a R nie tnie written.
++struct johnv8_ao_range { uintptr_t lo, hi; };
++struct johnv8_anyorder {
++    int  mode = 0;                    // 0 = OFF, 1 = ON, 2 = dry (decyzje + liczniki, launch zwykly)
++    std::vector<johnv8_ao_range> written, read;
++    bool poisoned = true;             // po operacji niekernelowej: nastepny launch barierowy
++    bool grant    = false;            // jednorazowy grant biezacego wezla (zjada go pierwszy launch)
++    int  n_barrier = 0, n_ao = 0, n_op = 0;   // liczniki w obrebie biezacego wezla
++    int64_t ao_since_barrier = 0;     // jadra any-order od ostatniej bariery (join na koncu grafu)
++    // statystyki (GGML_JOHNV8_ANYORDER_STATS=1)
++    int64_t st_graphs = 0, st_nodes = 0, st_launch_barrier = 0, st_launch_ao = 0, st_ops = 0, st_joins = 0;
++    int64_t st_grant[GGML_OP_COUNT] = {0};
++    int64_t st_deny[8] = {0};         // 0 RAW, 1 WAR, 2 WAW, 3 poisoned, 4 revoked, 5 declare-konflikt, 6 stream!=0, 7 niezuzyty
++    std::vector<johnv8_ao_range> extra_w, extra_r;   // zakresy ukryte (scratch, sloty q8) zadeklarowane przez op w biezacym wezle
++};
++extern thread_local johnv8_anyorder * johnv8_ao_cur;   // aktywny tylko wewnatrz graph_compute (bez capture grafu)
++// deklaracja ukrytego zakresu przez op: mode 0 = odczyt, 1 = zapis, 2 = zapis, ktory przed koncem wezla domyka launch barierowy
++// (np. slot q8: quantize -> matvec barierowy), wiec po wezle liczy sie tylko jako odczyt. Konflikt z trackerem odwoluje grant.
++static inline void johnv8_ao_declare(const void * p, size_t n, int mode) {
++    johnv8_anyorder * ao = johnv8_ao_cur;
++    if (ao == nullptr || p == nullptr || n == 0) return;
++    const johnv8_ao_range r = { (uintptr_t) p, (uintptr_t) p + n };
++    if (ao->grant) {
++        bool conflict = false;
++        for (const auto & b : ao->written) { if (r.lo < b.hi && b.lo < r.hi) { conflict = true; break; } }
++        if (!conflict && mode != 0) { for (const auto & b : ao->read) { if (r.lo < b.hi && b.lo < r.hi) { conflict = true; break; } } }
++        if (conflict) { ao->grant = false; ao->st_deny[5]++; }
++    }
++    if (mode == 1) { ao->extra_w.push_back(r); } else { ao->extra_r.push_back(r); }
++}
++static inline void johnv8_ao_revoke() {
++    if (johnv8_ao_cur != nullptr && johnv8_ao_cur->grant) { johnv8_ao_cur->grant = false; johnv8_ao_cur->st_deny[4]++; }
++}
++
+ template<typename T>
+ struct ggml_cuda_pool_alloc {
+     ggml_cuda_pool * pool = nullptr;
+@@ -1197,6 +1233,7 @@ struct ggml_cuda_pool_alloc {
+     T * alloc(size_t size) {
+         GGML_ASSERT(pool != nullptr);
+         GGML_ASSERT(ptr == nullptr);
++        johnv8_ao_revoke();   // [johnv8] E64: pamiec puli jest LIFO-reuzywana przez nastepny wezel
+         ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size);
+         return ptr;
+     }
+@@ -1521,6 +1558,7 @@ struct ggml_backend_cuda_context {
+     uint64_t fuse_plan_skipped = 0, fuse_plan_probed = 0;
+     johnv8_q8_cache q8cache;   // [johnv8] E6d
+     johnv8_hcb_scratch hcb;    // [johnv8] E10c
++    johnv8_anyorder    ao;     // [johnv8] E64
+     int device;
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+@@ -1789,6 +1827,64 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+     }
+ #endif //defined(GGML_CUDA_USE_PDL)
+ 
++#if defined(GGML_USE_HIP)
++    // [johnv8] E64: any-order — grant zjada pierwszy launch wezla, kazdy kolejny jest barierowy
++    if (johnv8_anyorder * ao = johnv8_ao_cur; ao != nullptr) {
++        if (ao->grant) {
++            ao->grant = false;
++            ao->n_ao++;
++            ao->ao_since_barrier++;
++            if (ao->mode == 1) {
++                hipExtLaunchKernelGGL(kernel, launch_params.block_nums, launch_params.block_dims, (uint32_t) launch_params.shmem,
++                                      launch_params.stream, nullptr, nullptr, hipExtAnyOrderLaunch, std::forward<Args>(args)...);
++                CUDA_CHECK(cudaGetLastError());
++                return;
++            }
++        } else {
++            ao->n_barrier++;
++        }
++    }
++#endif // GGML_USE_HIP
+     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+     CUDA_CHECK(cudaGetLastError());
+ }
++
++// [johnv8] E64C: kopie przez kernel (zamiast cudaMemcpyAsync/2DAsync) gdy any-order jest aktywny — memcpy zatruwalo tracker.
++static __global__ void johnv8_cpy_bytes16_kernel(const char * __restrict__ src, char * __restrict__ dst, const int64_t n) {
++    const int64_t i   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t n16 = n / 16;
++    if (i < n16) {
++        ((uint4 *) dst)[i] = ((const uint4 *) src)[i];
++    } else if (i == n16) {
++        for (int64_t k = n16 * 16; k < n; k++) { dst[k] = src[k]; }
++    }
++}
++static __global__ void johnv8_cpy_bytes1_kernel(const char * __restrict__ src, char * __restrict__ dst, const int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) { dst[i] = src[i]; }
++}
++static __global__ void johnv8_cpy_bytes2d_kernel(const char * __restrict__ src, const int64_t spitch, char * __restrict__ dst, const int64_t dpitch,
++                                                 const int64_t width, const int64_t height) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= width * height) return;
++    const int64_t r = i / width, c = i - r * width;
++    dst[r * dpitch + c] = src[r * spitch + c];
++}
++static inline void johnv8_cpy_bytes_cuda(char * dst, const char * src, size_t n, cudaStream_t stream) {
++    if (n == 0) return;
++    const bool aligned = ((uintptr_t) dst % 16 == 0) && ((uintptr_t) src % 16 == 0);
++    const int64_t threads = aligned ? (int64_t) (n / 16 + 1) : (int64_t) n;
++    const int64_t blocks  = (threads + 255) / 256;
++    GGML_ASSERT(blocks <= INT_MAX);
++    const ggml_cuda_kernel_launch_params lp((dim3) (unsigned) blocks, (dim3) 256, (size_t) 0, stream);
++    if (aligned) { ggml_cuda_kernel_launch(johnv8_cpy_bytes16_kernel, lp, src, dst, (int64_t) n); }
++    else         { ggml_cuda_kernel_launch(johnv8_cpy_bytes1_kernel,  lp, src, dst, (int64_t) n); }
++}
++static inline void johnv8_cpy_bytes_2d_cuda(char * dst, size_t dpitch, const char * src, size_t spitch, size_t width, size_t height, cudaStream_t stream) {
++    const int64_t total = (int64_t) width * (int64_t) height;
++    if (total == 0) return;
++    const int64_t blocks = (total + 255) / 256;
++    GGML_ASSERT(blocks <= INT_MAX);
++    const ggml_cuda_kernel_launch_params lp((dim3) (unsigned) blocks, (dim3) 256, (size_t) 0, stream);
++    ggml_cuda_kernel_launch(johnv8_cpy_bytes2d_kernel, lp, src, (int64_t) spitch, dst, (int64_t) dpitch, (int64_t) width, (int64_t) height);
++}
+diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
+index 6df8901..ccdc447 100644
+--- a/ggml/src/ggml-cuda/concat.cu
++++ b/ggml/src/ggml-cuda/concat.cu
+@@ -158,8 +158,13 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
+         const size_t size0 = ggml_nbytes(src0);
+         const size_t size1 = ggml_nbytes(src1);
+ 
++        if (johnv8_ao_cur != nullptr) {   // [johnv8] E64C
++            johnv8_cpy_bytes_cuda((char *) dst->data,         (const char *) src0->data, size0, stream);
++            johnv8_cpy_bytes_cuda((char *) dst->data + size0, (const char *) src1->data, size1, stream);
++        } else {
+         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
+         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
++        }
+     } else {
+         GGML_ASSERT(!ggml_is_quantized(src0->type));
+ 
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index fd7ffc0..9a66f63 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -471,11 +471,13 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+         } else
+ #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
+         {
+-            CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
++            if (johnv8_ao_cur != nullptr) { johnv8_cpy_bytes_cuda(src1_ddc, src0_ddc, ggml_nbytes(src0), main_stream); }   // [johnv8] E64C
++            else { CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream)); }
+         }
+     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+-        CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
+-                                     mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
++        if (johnv8_ao_cur != nullptr) { johnv8_cpy_bytes_2d_cuda(src1_ddc, mc_dpitch, src0_ddc, mc_spitch, mc_width, mc_height, main_stream); }   // [johnv8] E64C
++        else { CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
++                                     mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream)); }
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+         if (can_be_transposed) {
+             ggml_cpy_scalar_cuda<float, float, true>
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d374dd5..bcb3d32 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -92,6 +92,7 @@
+ #include <mutex>
+ #include <cstdarg>
+ #include <cstdio>
++#include <cstring>
+ #include <cstdlib>
+ #include <string>
+ #include <vector>
+@@ -458,6 +459,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+     }
+ 
+     void * alloc(size_t size, size_t * actual_size) override {
++        johnv8_ao_revoke();   // [johnv8] E64
+ #ifdef DEBUG_CUDA_MALLOC
+         int nnz = 0;
+         size_t max_size = 0;
+@@ -574,6 +576,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     }
+ 
+     void * alloc(size_t size, size_t * actual_size) override {
++        johnv8_ao_revoke();   // [johnv8] E64
+         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
+         const size_t alignment = 128;
+         size = alignment * ((size + alignment - 1) / alignment);
+@@ -1628,6 +1631,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+ }
+ 
+ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    johnv8_ao_revoke();   // [johnv8] E64: hipBLAS + pula
+     ggml_type compute_type = src0->type;
+     if (ggml_is_quantized(compute_type)) {
+         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+@@ -1820,6 +1824,207 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_q;
+ }
+ 
++// ============================================================================================
++// [johnv8] E64: any-order z trackerem hazardow (patrz common.cuh: johnv8_anyorder, PLAN_ANYORDER.md)
++// Env: GGML_JOHNV8_ANYORDER=0|1|dry, GGML_JOHNV8_ANYORDER_STATS=1. Tylko HIP, tylko bez capture grafu.
++// ============================================================================================
++thread_local johnv8_anyorder * johnv8_ao_cur = nullptr;
++
++void johnv8_ao_stream_op(void) {
++    if (johnv8_ao_cur != nullptr) { johnv8_ao_cur->n_op++; johnv8_ao_cur->poisoned = true; if (johnv8_ao_cur->grant) { johnv8_ao_cur->grant = false; johnv8_ao_cur->st_deny[4]++; } }
++}
++
++static int johnv8_ao_mode_env() {
++    static const int m = []() {
++        const char * e = getenv("GGML_JOHNV8_ANYORDER");
++        if (e == nullptr) return 0;
++        if (strcmp(e, "dry") == 0) return 2;
++        return atoi(e) != 0 ? 1 : 0;
++    }();
++    return m;
++}
++static int johnv8_ao_minnodes_env() {
++    static const int v = getenv("GGML_JOHNV8_ANYORDER_MINNODES") ? atoi(getenv("GGML_JOHNV8_ANYORDER_MINNODES")) : 400;
++    return v;
++}
++static bool johnv8_ao_stats_env() {
++    static const bool v = getenv("GGML_JOHNV8_ANYORDER_STATS") != nullptr && atoi(getenv("GGML_JOHNV8_ANYORDER_STATS")) != 0;
++    return v;
++}
++
++static __global__ void johnv8_ao_join_kernel() {}
++
++static inline johnv8_ao_range johnv8_ao_range_of(const ggml_tensor * t) {
++    const size_t sz = t->buffer != nullptr ? ggml_backend_buft_get_alloc_size(t->buffer->buft, t) : ggml_nbytes(t);
++    const uintptr_t lo = (uintptr_t) t->data;
++    return { lo, lo + sz };
++}
++static inline bool johnv8_ao_overlaps(const johnv8_ao_range & a, const std::vector<johnv8_ao_range> & v) {
++    for (const auto & b : v) { if (a.lo < b.hi && b.lo < a.hi) return true; }
++    return false;
++}
++// zbiory W (dst wszystkich wezlow grupy) i R (wszystkie src) — nadzbior jest zawsze bezpieczny
++static int johnv8_ao_sets(const ggml_cgraph * cgraph, int i, int n, johnv8_ao_range * W, int * nw, johnv8_ao_range * R, int * nr) {
++    *nw = 0; *nr = 0;
++    n = std::min(n, cgraph->n_nodes - i);
++    if (n <= 1) {
++        const ggml_tensor * t = cgraph->nodes[i];
++        if (t->data != nullptr) { W[(*nw)++] = johnv8_ao_range_of(t); }
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            if (t->src[j] != nullptr && t->src[j]->data != nullptr) { R[(*nr)++] = johnv8_ao_range_of(t->src[j]); }
++        }
++        return n;
++    }
++    // grupa fuzji: jadro pisze tylko ostatni wezel (pozostale wyjscia deklaruje op przez johnv8_ao_declare),
++    // a czyta tylko src spoza grupy (posrednie wezly fuzji nigdy nie trafiaja do pamieci)
++    // W: ostatni wezel + kazdy wezel grupy, ktory ma konsumenta poza grupa (liczba uzyc > uzycia wewnatrz grupy)
++    // lub jest wyjsciem grafu — tylko takie tensory fuzja naprawde zapisuje.
++    for (int k = 0; k < n && *nw < 16; k++) {
++        const ggml_tensor * t = cgraph->nodes[i + k];
++        if (t->data == nullptr) continue;
++        bool out = (k == n - 1) || (t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
++        if (!out) {
++            int uses_in = 0;
++            for (int m = 0; m < n; m++) {
++                if (m == k) continue;
++                const ggml_tensor * u = cgraph->nodes[i + m];
++                for (int j = 0; j < GGML_MAX_SRC; j++) { if (u->src[j] == t) { uses_in++; } }
++            }
++            out = ggml_node_get_use_count(cgraph, i + k) > uses_in;
++        }
++        if (out) { W[(*nw)++] = johnv8_ao_range_of(t); }
++    }
++    for (int k = 0; k < n; k++) {
++        const ggml_tensor * t = cgraph->nodes[i + k];
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            const ggml_tensor * src = t->src[j];
++            if (src == nullptr || src->data == nullptr || *nr >= 16 * GGML_MAX_SRC) continue;
++            bool inner = false;
++            for (int m = 0; m < n; m++) { if (src == cgraph->nodes[i + m]) { inner = true; break; } }
++            if (!inner) { R[(*nr)++] = johnv8_ao_range_of(src); }
++        }
++    }
++    return n;
++}
++
++// whitelista etapu 1: ops jednojadrowe, bez puli, czytajace tylko src i piszace dst (przez ggml_cuda_kernel_launch)
++static bool johnv8_ao_whitelisted(const ggml_tensor * node) {
++    switch (node->op) {
++        case GGML_OP_MUL_MAT:   // sciezki mmq/mmf/cublas odwoluja grant u wejscia; mmvf i mmvq (sloty q8 deklarowane) zostaja
++        case GGML_OP_MUL_MAT_ID:   // mmvq/mmvf wprost; ids-helper alokuje pule (revoke), fallback z memcpy (revoke)
++        case GGML_OP_ADD: case GGML_OP_SUB: case GGML_OP_MUL: case GGML_OP_DIV:
++        case GGML_OP_SCALE: case GGML_OP_RMS_NORM:
++        case GGML_OP_CPY: case GGML_OP_CONT: case GGML_OP_DUP: case GGML_OP_CONCAT: case GGML_OP_SET_ROWS:   // E64C: kopie przez kernel
++            return true;
++        case GGML_OP_UNARY:
++            return ggml_get_unary_op(node) != GGML_UNARY_OP_XIELU;
++        case GGML_OP_GLU: {
++            const ggml_glu_op g = ggml_get_glu_op(node);
++            return (g == GGML_GLU_OP_SWIGLU || g == GGML_GLU_OP_GEGLU || g == GGML_GLU_OP_REGLU) && ggml_get_op_params_f32(node, 3) == 0.0f;
++        }
++        case GGML_OP_ROPE: {
++            const int mode = ((const int32_t *) node->op_params)[2];
++            return mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE;
++        }
++        case GGML_OP_GET_ROWS: {
++            const ggml_type t = node->src[0]->type;
++            return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
++        }
++        default:
++            return false;
++    }
++}
++
++// prosba o grant dla grupy wezlow [i, i+n) — przed dispatchem
++static void johnv8_ao_request(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int n) {
++    johnv8_anyorder * ao = johnv8_ao_cur;
++    if (ao == nullptr) return;
++    ao->grant = false;
++    if (ctx.curr_stream_no != 0) { ao->st_deny[6]++; return; }
++    if (ao->poisoned)            { ao->st_deny[3]++; return; }
++    johnv8_ao_range W[16], R[16 * GGML_MAX_SRC]; int nw, nr;
++    johnv8_ao_sets(cgraph, i, n, W, &nw, R, &nr);
++    for (int k = 0; k < nw; k++) {
++        if (johnv8_ao_overlaps(W[k], ao->written)) { ao->st_deny[2]++; return; }   // WAW
++        if (johnv8_ao_overlaps(W[k], ao->read))    { ao->st_deny[1]++; return; }   // WAR
++    }
++    for (int k = 0; k < nr; k++) {
++        if (johnv8_ao_overlaps(R[k], ao->written)) { ao->st_deny[0]++; return; }   // RAW
++    }
++    ao->grant = true;
++    ao->st_grant[cgraph->nodes[i]->op]++;
++}
++
++// po dispatchu grupy: aktualizacja trackera
++static void johnv8_ao_commit(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int n) {
++    johnv8_anyorder * ao = johnv8_ao_cur;
++    if (ao == nullptr) return;
++    GGML_UNUSED(ctx);
++    ao->st_nodes++; ao->st_launch_barrier += ao->n_barrier; ao->st_launch_ao += ao->n_ao; ao->st_ops += ao->n_op;
++    if (ao->grant) { ao->grant = false; ao->st_deny[7]++; }   // grant niezuzyty (launch poza wrapperem lub brak launchu)
++    if (ao->n_barrier > 0 || ao->n_op > 0) {
++        // launch barierowy (F1) / operacja niekernelowa: wszystko wczesniejsze jest zakonczone
++        ao->written.clear(); ao->read.clear();
++        ao->poisoned = ao->n_op > 0;
++        if (ao->n_barrier > 0 && ao->n_op == 0) { ao->ao_since_barrier = 0; }
++    }
++    johnv8_ao_range W[16], R[16 * GGML_MAX_SRC]; int nw, nr;
++    johnv8_ao_sets(cgraph, i, n, W, &nw, R, &nr);
++    for (int k = 0; k < nw; k++) ao->written.push_back(W[k]);
++    for (int k = 0; k < nr; k++) ao->read.push_back(R[k]);
++    for (const auto & r : ao->extra_w) ao->written.push_back(r);
++    for (const auto & r : ao->extra_r) ao->read.push_back(r);
++    ao->extra_w.clear(); ao->extra_r.clear();
++    ao->n_barrier = 0; ao->n_ao = 0; ao->n_op = 0;
++}
++
++static void johnv8_ao_begin_graph(ggml_backend_cuda_context & ctx, bool enabled) {
++    johnv8_ao_cur = nullptr;
++    const int mode = johnv8_ao_mode_env();
++    if (mode == 0) return;
++#if !defined(GGML_USE_HIP)
++    GGML_UNUSED(ctx); GGML_UNUSED(enabled);
++    return;
++#else
++    if (!enabled) {
++        static bool said = false;
++        if (johnv8_ao_stats_env() && !said) { said = true; fprintf(stderr, "[johnv8-anyorder] graf z capture HIP -> any-order nieaktywny dla tego grafu (flaga nie przezywa capture)\n"); }
++        return;
++    }
++    johnv8_anyorder & ao = ctx.ao;
++    ao.mode = mode;
++    ao.written.clear(); ao.read.clear();
++    if (ao.written.capacity() < 4096) { ao.written.reserve(4096); ao.read.reserve(8192); }
++    ao.poisoned = true; ao.grant = false; ao.extra_w.clear(); ao.extra_r.clear();
++    ao.n_barrier = 0; ao.n_ao = 0; ao.n_op = 0; ao.ao_since_barrier = 0;
++    johnv8_ao_cur = &ao;
++#endif
++}
++
++static void johnv8_ao_end_graph(ggml_backend_cuda_context & ctx) {
++    johnv8_anyorder * ao = johnv8_ao_cur;
++    if (ao == nullptr) return;
++    if (ao->ao_since_barrier > 0) {
++        // ostatni pakiet na strumieniu ma byc barierowy (kopie schedulera / zdarzenia poza graph_compute)
++        if (ao->mode == 1) { johnv8_ao_join_kernel<<<1, 1, 0, ctx.stream()>>>(); CUDA_CHECK(cudaGetLastError()); }
++        ao->st_joins++;
++        ao->ao_since_barrier = 0;
++    }
++    ao->st_graphs++;
++    if (johnv8_ao_stats_env() && (ao->st_graphs % 64) == 0) {
++        const double g = (double) ao->st_graphs;
++        const double la = (double) ao->st_launch_ao, lb = (double) ao->st_launch_barrier;
++        fprintf(stderr, "[johnv8-anyorder] tryb=%s grafy=%lld wezly/graf=%.0f launch/graf: bariera %.0f any-order %.0f (%.1f%%) ops %.1f join %.2f | odmowy/graf: RAW %.0f WAR %.0f WAW %.0f poison %.0f revoke %.0f stream %.0f niezuzyte %.0f | granty/graf:",
++                ao->mode == 1 ? "ON" : "dry", (long long) ao->st_graphs, (double) ao->st_nodes / g, lb / g, la / g, 100.0 * la / std::max(1.0, la + lb),
++                (double) ao->st_ops / g, (double) ao->st_joins / g,
++                (double) ao->st_deny[0] / g, (double) ao->st_deny[1] / g, (double) ao->st_deny[2] / g, (double) ao->st_deny[3] / g,
++                (double) ao->st_deny[4] / g, (double) ao->st_deny[6] / g, (double) ao->st_deny[7] / g);
++        for (int op = 0; op < GGML_OP_COUNT; op++) { if (ao->st_grant[op] > 0) fprintf(stderr, " %s %.0f", ggml_op_name((ggml_op) op), (double) ao->st_grant[op] / g); }
++        fprintf(stderr, "\n");
++    }
++    johnv8_ao_cur = nullptr;
++}
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -3582,6 +3787,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
+                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
++                    johnv8_ao_request(*cuda_ctx, cgraph, i, (int) ops.size());   // [johnv8] E64
++                    johnv8_ao_declare(weights->data, ggml_nbytes(weights), 1); johnv8_ao_declare(ids->data, ggml_nbytes(ids), 1);   // wyjscia fuzji
+                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                     return ops.size() - 1;
+                 }
+@@ -3597,6 +3804,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
+                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
++                    johnv8_ao_request(*cuda_ctx, cgraph, i, (int) ops.size());   // [johnv8] E64
++                    johnv8_ao_declare(weights->data, ggml_nbytes(weights), 1); johnv8_ao_declare(ids->data, ggml_nbytes(ids), 1);   // wyjscia fuzji
+                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                     return ops.size() - 1;
+                 }
+@@ -3688,8 +3897,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             }
+             fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
+             if (node->op == GGML_OP_ADD) {
++                johnv8_ao_request(*cuda_ctx, cgraph, i, n_fuse);   // [johnv8] E64
+                 ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
+             } else {
++                johnv8_ao_request(*cuda_ctx, cgraph, i, n_fuse);   // [johnv8] E64
+                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
+             }
+             return n_fuse - 1;
+@@ -3829,6 +4040,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
+ 
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
++                    johnv8_ao_request(*cuda_ctx, cgraph, i, n_ops);   // [johnv8] E64
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                     fused_mul_mat_vec = true;
+                     fused_node_count  = n_ops;
+@@ -3923,6 +4135,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
+ 
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
++                    johnv8_ao_request(*cuda_ctx, cgraph, i, n_ops);   // [johnv8] E64
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                     fused_mul_mat_vec = true;
+                     fused_node_count  = n_ops;
+@@ -3979,6 +4192,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+ 
++                johnv8_ao_request(*cuda_ctx, cgraph, i, 5);   // [johnv8] E64
+                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+                 fused_node_count  = 5;
+@@ -3993,6 +4207,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+ 
++                johnv8_ao_request(*cuda_ctx, cgraph, i, 5);   // [johnv8] E64
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+                 fused_node_count  = 5;
+@@ -4020,6 +4235,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+ 
++                johnv8_ao_request(*cuda_ctx, cgraph, i, 3);   // [johnv8] E64
+                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+                 fused_node_count  = 3;
+@@ -4032,6 +4248,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+ 
++                johnv8_ao_request(*cuda_ctx, cgraph, i, 3);   // [johnv8] E64
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+                 fused_node_count  = 3;
+@@ -4120,6 +4337,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             fusion_data.x_scale = scale;
+ 
+             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++                johnv8_ao_request(*cuda_ctx, cgraph, i, n_ops);   // [johnv8] E64
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                 fused_mul_mat_vec = true;
+                 fused_node_count  = n_ops;
+@@ -4178,6 +4396,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         fusion_data.x_bias = bias_tensor;
+ 
+         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
++            johnv8_ao_request(*cuda_ctx, cgraph, i, 2);   // [johnv8] E64
+             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+             fused_mul_mat_vec = true;
+             fused_node_count  = 2;
+@@ -4185,6 +4404,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+ 
+         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++            johnv8_ao_request(*cuda_ctx, cgraph, i, 2);   // [johnv8] E64
+             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+             fused_mul_mat_vec = true;
+             fused_node_count  = 2;
+@@ -4197,21 +4417,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 5);   // [johnv8] E64
++        johnv8_ao_declare(cgraph->nodes[i + 2]->data, ggml_nbytes(cgraph->nodes[i + 2]), 1);   // wyjscie rope
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+         return 4;
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 3);   // [johnv8] E64
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
+         return 2;
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 3);   // [johnv8] E64
+         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 2);   // [johnv8] E64
+         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+         return 1;
+     }
+@@ -4250,6 +4475,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     // [johnv8] SCALE + UNARY(SILU) -> jedno jadro (hc_down w build_hc_mix)
+     if (ggml_cuda_scale_silu_ok(cgraph, i)) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 2);   // [johnv8] E64
+         ggml_cuda_op_scale_silu(*cuda_ctx, cgraph, i);
+         return 1;
+     }
+@@ -4257,11 +4483,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 2);   // [johnv8] E64
+         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+         return 1;
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 2);   // [johnv8] E64
+         ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
+         return 1;
+     }
+@@ -4277,12 +4505,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+               GGML_OP_VIEW,    GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD },
+             { GGML_UNARY_OP_SIGMOID }))
+         && ggml_cuda_hc_combine_ok(cgraph, i)) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 8);   // [johnv8] E64
+         ggml_cuda_op_hc_combine(*cuda_ctx, cgraph, i);
+         return 7;
+     }
+ 
+     // [johnv8] E10c: blok hc w dwoch jadrach (A: norm..silu, B: hc_up..mix)
+     if (node->op == GGML_OP_RMS_NORM && ggml_cuda_hcblock_a_ok(cgraph, i)) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 6);   // [johnv8] E64
+         ggml_cuda_op_hcblock_a(*cuda_ctx, cgraph, i);
+         return 5;
+     }
+@@ -4296,6 +4526,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     // [johnv8] E10a: MUL_MAT(hc_inject) + lancuch combine (9 wezlow) -> jedno jadro
+     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_hc_combine_inject_ok(cgraph, i)) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 9);   // [johnv8] E64
+         ggml_cuda_op_hc_combine_inject(*cuda_ctx, cgraph, i);
+         return 8;
+     }
+@@ -4303,6 +4534,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     // [johnv8] E6b: sigmoid(gate) * shexp + moe_out -> jedno jadro
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { GGML_UNARY_OP_SIGMOID })
+         && ggml_cuda_shexp_tail_ok(cgraph, i)) {
++        johnv8_ao_request(*cuda_ctx, cgraph, i, 3);   // [johnv8] E64
+         ggml_cuda_op_shexp_tail(*cuda_ctx, cgraph, i);
+         return 2;
+     }
+@@ -4531,6 +4763,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
++                    johnv8_ao_commit(*cuda_ctx, cgraph, i, 1 + nodes_to_skip);   // [johnv8] E64
+                     i += nodes_to_skip;
+                     continue;
+                 }
+@@ -4552,7 +4785,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #endif  // NDEBUG
+ 
+                 const int64_t johnv8_t1 = johnv8_timing ? ggml_time_us() : 0;
++                if (johnv8_ao_cur != nullptr && johnv8_ao_whitelisted(node)) { johnv8_ao_request(*cuda_ctx, cgraph, i, 1); }   // [johnv8] E64
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
++                johnv8_ao_commit(*cuda_ctx, cgraph, i, 1);   // [johnv8] E64
+                 if (johnv8_timing) { johnv8_t_fwd += ggml_time_us() - johnv8_t1; }
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+@@ -4640,7 +4875,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    // [johnv8] E64C: przy any-order duze grafy ida bez capture (any-order), male (MTP) zostaja w grafach HIP
++    const bool johnv8_ao_big = johnv8_ao_mode_env() != 0 && cgraph->n_nodes >= johnv8_ao_minnodes_env();
++    if (graph->is_enabled() && !johnv8_ao_big) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+@@ -4679,7 +4916,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+     }
+ 
++    johnv8_ao_begin_graph(*cuda_ctx, !use_cuda_graph);   // [johnv8] E64: any-order tylko bez capture grafu
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
++    johnv8_ao_end_graph(*cuda_ctx);
+ 
+     return GGML_STATUS_SUCCESS;
+ }
+diff --git a/ggml/src/ggml-cuda/hc-block.cu b/ggml/src/ggml-cuda/hc-block.cu
+index 2aa98d0..c81c367 100644
+--- a/ggml/src/ggml-cuda/hc-block.cu
++++ b/ggml/src/ggml-cuda/hc-block.cu
+@@ -408,11 +408,15 @@ void ggml_cuda_op_hcblock_a(ggml_backend_cuda_context & ctx, const ggml_cgraph *
+     block_q8_1 * yq2 = (block_q8_1 *) H.ensure_buf(&H.yq2, &H.yq2_cap, yq2_bytes);
+     float      * los = (float *)      H.ensure_buf(&H.buf, &H.cap,     lo_bytes);
+     int        * cnt = (int *)        H.ensure_buf(&H.counter, &H.counter_cap, 256, true);
++    // [johnv8] E64: scratch spoza tensorow — a0 (any-order) pisze yq; a1 (bariera) czyta yq, pisze lo/yq2/counter
++    johnv8_ao_declare(yq,  yq_bytes,  1); johnv8_ao_declare(yq2, yq2_bytes, 1);
++    johnv8_ao_declare(los, lo_bytes,  1); johnv8_ao_declare(cnt, 256, 1);
+     if (!yq || !yq2 || !los || !cnt) { GGML_ABORT("hcblock: brak pamieci na bufory kontekstu"); }
+     const float * x_d = (const float *) x->data; const float * w_d = (const float *) w->data;
+     float * xn_d = (float *) mul->data; float * lo_d = (float *) silu->data;
+     {
+         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nt * hc, 1, 1), dim3(HCB_NORM_THREADS, 1, 1), 0, ctx.stream());
++        johnv8_ao_declare(xn_d, ggml_nbytes(cgraph->nodes[node_idx]), 1);   // [johnv8] E64C: xn (wyjscie RMS_NORM) pisze a0, czyta hcblock_b
+         ggml_cuda_kernel_launch(hcblock_a0_f32, lp, x_d, w_d, xn_d, yq, n_embd, hc, eps);
+     }
+     switch (nt) {
+diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
+index 646a589..0b4ec37 100644
+--- a/ggml/src/ggml-cuda/mmf.cu
++++ b/ggml/src/ggml-cuda/mmf.cu
+@@ -11,6 +11,7 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
+ }
+ 
+ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    johnv8_ao_revoke();   // [johnv8] E64: q8-cache / pula / wiele launchy -> barierowo
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
+     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 7fb4401..5ea054c 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -84,6 +84,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+ 
+ void ggml_cuda_mul_mat_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    johnv8_ao_revoke();   // [johnv8] E64: q8-cache / pula / wiele launchy -> barierowo
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 33c3ece..7f4d195 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1477,9 +1477,11 @@ void ggml_cuda_mul_mat_vec_q(
+         const bool dedup = johnv8_q8_dedup_enabled();
+         char * cached = dedup ? ctx.q8cache.find(src1, q8_bytes) : nullptr;
+         if (cached != nullptr) {
++            johnv8_ao_declare(cached, q8_bytes, 0);   // [johnv8] E64: slot q8 czytany przez matvec
+             src1_q8_1 = cached;
+         } else {
+             char * slot = dedup ? ctx.q8cache.insert(src1, q8_bytes) : nullptr;
++            johnv8_ao_declare(slot, q8_bytes, 2);   // [johnv8] E64: quantize (any-order) pisze slot, matvec (bariera) go czyta
+             src1_q8_1 = slot != nullptr ? slot : src1_q8_1_pool.alloc(q8_bytes);
+             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+         }
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index ae0d9dc..1373c20 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -5,6 +5,22 @@
+ #include <hipblas/hipblas.h>
+ #include <hip/hip_fp16.h>
+ #include <hip/hip_bf16.h>
++#include <hip/hip_ext.h>   // [johnv8] E64: hipExtLaunchKernelGGL / hipExtAnyOrderLaunch
++
++// [johnv8] E64 any-order: kazda operacja niekernelowa na strumieniu zatruwa tracker hazardow
++// (nastepny launch musi byc barierowy) — patrz johnv8_anyorder w common.cuh i PLAN_ANYORDER.md.
++void johnv8_ao_stream_op(void);
++static inline hipError_t johnv8_hip_memcpy_async(void * dst, const void * src, size_t n, hipMemcpyKind k, hipStream_t s = 0) { const hipError_t e = hipMemcpyAsync(dst, src, n, k, s); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_memcpy_peer_async(void * dst, int dd, const void * src, int sd, size_t n, hipStream_t s = 0) { const hipError_t e = hipMemcpyPeerAsync(dst, dd, src, sd, n, s); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_memcpy_2d_async(void * dst, size_t dp, const void * src, size_t sp, size_t w, size_t h, hipMemcpyKind k, hipStream_t s = 0) { const hipError_t e = hipMemcpy2DAsync(dst, dp, src, sp, w, h, k, s); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_memset_async(void * ptr, int v, size_t n, hipStream_t s = 0) { const hipError_t e = hipMemsetAsync(ptr, v, n, s); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_memcpy(void * dst, const void * src, size_t n, hipMemcpyKind k) { const hipError_t e = hipMemcpy(dst, src, n, k); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_memset(void * ptr, int v, size_t n) { const hipError_t e = hipMemset(ptr, v, n); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_event_record(hipEvent_t ev, hipStream_t s = 0) { const hipError_t e = hipEventRecord(ev, s); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_stream_wait_event(hipStream_t s, hipEvent_t ev, unsigned int f = 0) { const hipError_t e = hipStreamWaitEvent(s, ev, f); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_stream_synchronize(hipStream_t s) { const hipError_t e = hipStreamSynchronize(s); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_device_synchronize(void) { const hipError_t e = hipDeviceSynchronize(); johnv8_ao_stream_op(); return e; }
++static inline hipError_t johnv8_hip_launch_host_func(hipStream_t s, hipHostFn_t fn, void * d) { const hipError_t e = hipLaunchHostFunc(s, fn, d); johnv8_ao_stream_op(); return e; }
+ 
+ #ifdef GGML_USE_NCCL
+ #include <rccl/rccl.h>
+@@ -55,14 +71,14 @@
+ #define cudaDeviceGetAttribute hipDeviceGetAttribute
+ #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
+ #define cudaDeviceProp hipDeviceProp_t
+-#define cudaDeviceSynchronize hipDeviceSynchronize
++#define cudaDeviceSynchronize johnv8_hip_device_synchronize
+ #define cudaError_t hipError_t
+ #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+ #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+ #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+ #define cudaEventCreateWithFlags hipEventCreateWithFlags
+ #define cudaEventDisableTiming hipEventDisableTiming
+-#define cudaEventRecord hipEventRecord
++#define cudaEventRecord johnv8_hip_event_record
+ #define cudaEventSynchronize hipEventSynchronize
+ #define cudaEvent_t hipEvent_t
+ #define cudaEventDestroy hipEventDestroy
+@@ -78,21 +94,21 @@
+ #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
+ #define cudaHostUnregister hipHostUnregister
+ #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
+-#define cudaLaunchHostFunc hipLaunchHostFunc
++#define cudaLaunchHostFunc johnv8_hip_launch_host_func
+ #define cudaMalloc hipMalloc
+ #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+ #define cudaMallocManaged hipMallocManaged
+ #define cudaMemAdvise hipMemAdvise
+-#define cudaMemcpy hipMemcpy
+-#define cudaMemcpyAsync hipMemcpyAsync
+-#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+-#define cudaMemcpy2DAsync hipMemcpy2DAsync
++#define cudaMemcpy johnv8_hip_memcpy
++#define cudaMemcpyAsync johnv8_hip_memcpy_async
++#define cudaMemcpyPeerAsync johnv8_hip_memcpy_peer_async
++#define cudaMemcpy2DAsync johnv8_hip_memcpy_2d_async
+ #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+ #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+ #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+ #define cudaMemcpyKind hipMemcpyKind
+-#define cudaMemset hipMemset
+-#define cudaMemsetAsync hipMemsetAsync
++#define cudaMemset johnv8_hip_memset
++#define cudaMemsetAsync johnv8_hip_memset_async
+ #define cudaMemGetInfo hipMemGetInfo
+ #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
+ #define cudaSetDevice hipSetDevice
+@@ -116,8 +132,8 @@
+ #define cudaStreamFireAndForget hipStreamFireAndForget
+ #define cudaStreamNonBlocking hipStreamNonBlocking
+ #define cudaStreamPerThread hipStreamPerThread
+-#define cudaStreamSynchronize hipStreamSynchronize
+-#define cudaStreamWaitEvent hipStreamWaitEvent
++#define cudaStreamSynchronize johnv8_hip_stream_synchronize
++#define cudaStreamWaitEvent johnv8_hip_stream_wait_event
+ #define cudaGraphExec_t hipGraphExec_t
+ #define cudaGraphNode_t hipGraphNode_t
+ #define cudaKernelNodeParams hipKernelNodeParams

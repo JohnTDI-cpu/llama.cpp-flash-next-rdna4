@@ -1,0 +1,29 @@
+From 6735ff5016ede964dba5a5d23097276ba6cb7009 Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 02:49:03 +0200
+Subject: [PATCH 33/34] E10c v3b domyslnie ON (E45: bit-exact, +3% bez MTP,
+ +0,6% z MTP)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/hc-block.cu | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-block.cu b/ggml/src/ggml-cuda/hc-block.cu
+index 83b00df..2aa98d0 100644
+--- a/ggml/src/ggml-cuda/hc-block.cu
++++ b/ggml/src/ggml-cuda/hc-block.cu
+@@ -18,8 +18,8 @@
+ #define HCB_B_ELEMS      8
+ 
+ static int ggml_cuda_hcblock_mode() {
+-    // domyslnie OFF do walidacji v2 (E39); 1 = oba jadra, 2 = tylko A (A0+A1), 3 = tylko B (wymaga A dla kwantyzacji lo -> w praktyce = 1)
+-    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 0 : atoi(e); }();
++    // 0 = OFF, 1 = oba jadra (domyslnie), 2 = tylko A (A0+A1), 3 = tylko B (wymaga A dla kwantyzacji lo -> w praktyce = 1)
++    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 1 : atoi(e); }();   // v3b: bit-exact, +3% bez MTP, +0,6% z MTP (E45) -> domyslnie ON
+     return v;
+ }
+ bool ggml_cuda_hcblock_enabled() { return ggml_cuda_hcblock_mode() != 0; }
+-- 
+2.43.0
+

@@ -1,0 +1,141 @@
+From 0cf9e7856f45a34b1b683d1337f25f0d1720efdf Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 02:00:23 +0200
+Subject: [PATCH 30/34] E10c v3: A0 po jednym bloku na (token, strumien); B1 w
+ jednym przebiegu (1024 watkow, 4 strumienie x 8 elementow)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/hc-block.cu | 59 +++++++++++++++++-----------------
+ 1 file changed, 30 insertions(+), 29 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-block.cu b/ggml/src/ggml-cuda/hc-block.cu
+index d86c283..147bd92 100644
+--- a/ggml/src/ggml-cuda/hc-block.cu
++++ b/ggml/src/ggml-cuda/hc-block.cu
+@@ -14,7 +14,7 @@
+ // Arytmetyka replikuje bit w bit: norm.cu, binbcast MUL, quantize.cu, mmvq.cu (tablica RDNA4), hc-mix.cu.
+ #define HCB_NORM_THREADS 1024
+ #define HCB_MAX_NT       4
+-#define HCB_B_THREADS    256
++#define HCB_B_THREADS    1024
+ #define HCB_B_ELEMS      8
+ 
+ static int ggml_cuda_hcblock_mode() {
+@@ -68,35 +68,32 @@ static __device__ __forceinline__ float hcb_xn_elem(const float x, const float s
+     return johnv8_mul_nc(r, w);
+ }
+ 
+-// ---- A0: grid = nt, blok 1024
++// ---- A0: grid = nt*hc (blok = jeden strumien jednego tokena), blok 1024
+ static __global__ void __launch_bounds__(HCB_NORM_THREADS, 1)
+ hcblock_a0_f32(const float * __restrict__ x, const float * __restrict__ w_norm, float * __restrict__ xn_out,
+                block_q8_1 * __restrict__ yq, const int n_embd, const int hc, const float eps) {
+     __shared__ float s_sum[32];
+-    __shared__ float scales[8];
+-    const int t   = blockIdx.x;
++    const int t   = blockIdx.x / hc;
++    const int c   = blockIdx.x - t * hc;
+     const int tid = threadIdx.x;
+     const int hc_dim = n_embd * hc;
+     const int nblk   = hc_dim / QK8_1;
+-    for (int c = 0; c < hc; ++c) {
+-        const float * xr = x + ((int64_t) t * hc + c) * n_embd;
+-        float tmp = 0.0f;
+-        for (int col = tid; col < n_embd; col += HCB_NORM_THREADS) { const float xi = xr[col]; tmp += xi * xi; }
+-        tmp = hcb_block_reduce_sum_1024(tmp, s_sum);
+-        const float mean  = tmp / n_embd;
+-        const float scale = rsqrtf(mean + eps);
+-        if (tid == 0) { scales[c] = scale; }
+-    }
+-    __syncthreads();
+-    for (int idx = tid; idx < hc_dim; idx += HCB_NORM_THREADS) {
+-        const int c = idx / n_embd; const int col = idx - c * n_embd;
+-        xn_out[(int64_t) t * hc_dim + idx] = hcb_xn_elem(x[((int64_t) t * hc + c) * n_embd + col], scales[c], w_norm[idx]);
+-    }
++    const float * xr = x + ((int64_t) t * hc + c) * n_embd;
++    float tmp = 0.0f;
++    for (int col = tid; col < n_embd; col += HCB_NORM_THREADS) { const float xi = xr[col]; tmp += xi * xi; }
++    tmp = hcb_block_reduce_sum_1024(tmp, s_sum);
++    const float mean  = tmp / n_embd;
++    const float scale = rsqrtf(mean + eps);
++    const float * wr = w_norm + (int64_t) c * n_embd;
++    float * xo = xn_out + (int64_t) t * hc_dim + (int64_t) c * n_embd;
++    for (int col = tid; col < n_embd; col += HCB_NORM_THREADS) { xo[col] = hcb_xn_elem(xr[col], scale, wr[col]); }
++    // kwantyzacja: bloki q8_1 tego strumienia (n_embd % 32 == 0 -> granice blokow pokrywaja sie ze strumieniami)
+     const int warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
+-    for (int b = warp; b < nblk; b += HCB_NORM_THREADS / WARP_SIZE) {
+-        const int idx = b * QK8_1 + lane; const int c = idx / n_embd; const int col = idx - c * n_embd;
+-        const float xi = hcb_xn_elem(x[((int64_t) t * hc + c) * n_embd + col], scales[c], w_norm[idx]);
+-        hcb_quantize_block(xi, &yq[t * nblk + b], lane);
++    const int b0 = (c * n_embd) / QK8_1, nb = n_embd / QK8_1;
++    for (int b = warp; b < nb; b += HCB_NORM_THREADS / WARP_SIZE) {
++        const int col = b * QK8_1 + lane;
++        const float xi = hcb_xn_elem(xr[col], scale, wr[col]);
++        hcb_quantize_block(xi, &yq[t * nblk + b0 + b], lane);
+     }
+ }
+ 
+@@ -193,7 +190,7 @@ hcblock_b1_f32(const block_q8_1 * __restrict__ yq2, const void * __restrict__ Wu
+     constexpr int vthreads  = nwarps * warp_size;
+     constexpr int VB        = HCB_B_THREADS / vthreads;
+     constexpr int E         = HCB_B_ELEMS;
+-    static_assert(VB * rows == E, "VB*rows musi byc 8");
++    static_assert(VB * rows == 4 * E, "VB*rows musi byc 32 (4 strumienie x 8 elementow)");
+     constexpr int qk = QK8_0, qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ;
+     constexpr int blocks_per_iter = vdr * nwarps * warp_size / qi;
+     __shared__ float tmp_shared[VB][nwarps > 1 ? nwarps - 1 : 1][ncols_dst][rows][warp_size];
+@@ -205,8 +202,12 @@ hcblock_b1_f32(const block_q8_1 * __restrict__ yq2, const void * __restrict__ Wu
+     const int v = tid / vthreads, vtid = tid - v * vthreads, vwarp = vtid / warp_size, vlane = vtid - vwarp * warp_size;
+     const int blocks_per_row_x = R / qk;
+     const int kqs = vdr * (vtid % (qi / vdr));
+-    for (int c = 0; c < hc; ++c) {
+-        const int row0 = c * n_embd + i0 + v * rows;
++    {
++        // wiersze plaskie r = v*rows + i w [0,32): strumien c = r / E, element e = r % E; wymaga hc == 4
++        const int rflat0 = v * rows;
++        const int c      = rflat0 / E;
++        const int e0     = rflat0 - c * E;
++        const int row0   = c * n_embd + i0 + e0;
+         float tmp[ncols_dst][rows];
+ #pragma unroll
+         for (int j = 0; j < ncols_dst; ++j) {
+@@ -250,7 +251,7 @@ hcblock_b1_f32(const block_q8_1 * __restrict__ yq2, const void * __restrict__ Wu
+                         __asm__("" : "+v"(g));
+ #endif
+                         const float sg = 1.0f / (1.0f + expf(-g));
+-                        gated_s[j][c][v * rows + i] = johnv8_mul_nc(xn[(int64_t) j * hc_dim + row0 + i], sg);
++                        gated_s[j][c][e0 + i] = johnv8_mul_nc(xn[(int64_t) j * hc_dim + row0 + i], sg);
+                     }
+                 }
+             }
+@@ -299,7 +300,7 @@ bool ggml_cuda_hcblock_a_ok(const ggml_cgraph * cgraph, int node_idx) {
+     if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || Wd->type != GGML_TYPE_Q8_0 ||
+         rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) { HCB_REJECT("a", 4); }
+     const int64_t n_embd = x->ne[0], hc = x->ne[1], nt = x->ne[2], hc_dim = n_embd * hc;
+-    if (x->ne[3] != 1 || nt < 1 || nt > HCB_MAX_NT || hc < 2 || hc > 8) { HCB_REJECT("a", 5); }
++    if (x->ne[3] != 1 || nt < 1 || nt > HCB_MAX_NT || hc != 4) { HCB_REJECT("a", 5); }
+     if (n_embd % 32 != 0 || n_embd < HCB_NORM_THREADS || n_embd % HCB_B_ELEMS != 0) { HCB_REJECT("a", 6); }
+     if (rs->ne[0] != hc_dim || rs->ne[1] != nt || rs->ne[2] != 1 || rs->ne[3] != 1) { HCB_REJECT("a", 7); }
+     if (w->ne[0] != hc_dim || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1) { HCB_REJECT("a", 8); }
+@@ -342,7 +343,7 @@ bool ggml_cuda_hcblock_b_ok(const ggml_cgraph * cgraph, int node_idx, int * n_ex
+     const int64_t R = Wu->ne[0], hc_dim = Wu->ne[1], nt = lo->ne[1], n_embd = scl->ne[0];
+     if (n_embd <= 0 || hc_dim % n_embd != 0) { HCB_REJECT("b", 6); }
+     const int64_t hc = hc_dim / n_embd;
+-    if (nt < 1 || nt > HCB_MAX_NT || hc < 2 || hc > 8 || n_embd % HCB_B_ELEMS != 0 || R % 32 != 0) { HCB_REJECT("b", 7); }
++    if (nt < 1 || nt > HCB_MAX_NT || hc != 4 || n_embd % HCB_B_ELEMS != 0 || R % 32 != 0) { HCB_REJECT("b", 7); }
+     if (lo->ne[0] != R || lo->ne[2] != 1 || lo->ne[3] != 1 || Wu->ne[2] != 1 || Wu->ne[3] != 1) { HCB_REJECT("b", 8); }
+     if (mm->ne[0] != hc_dim || mm->ne[1] != nt || mm->ne[2] != 1 || mm->ne[3] != 1) { HCB_REJECT("b", 9); }
+     if (xn->ne[0] != hc_dim || xn->ne[1] != nt || xn->ne[2] != 1 || xn->ne[3] != 1) { HCB_REJECT("b", 10); }
+@@ -414,7 +415,7 @@ void ggml_cuda_op_hcblock_a(ggml_backend_cuda_context & ctx, const ggml_cgraph *
+     const float * x_d = (const float *) x->data; const float * w_d = (const float *) w->data;
+     float * xn_d = (float *) mul->data; float * lo_d = (float *) silu->data;
+     {
+-        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(HCB_NORM_THREADS, 1, 1), 0, ctx.stream());
++        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nt * hc, 1, 1), dim3(HCB_NORM_THREADS, 1, 1), 0, ctx.stream());
+         ggml_cuda_kernel_launch(hcblock_a0_f32, lp, x_d, w_d, xn_d, yq, n_embd, hc, eps);
+     }
+     switch (nt) {
+-- 
+2.43.0
+

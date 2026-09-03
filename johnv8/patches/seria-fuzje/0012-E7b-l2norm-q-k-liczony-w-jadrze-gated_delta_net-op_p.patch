@@ -1,0 +1,301 @@
+From 830cc4a010daccc052aaf2df316e80855cb0f1f8 Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 00:05:15 +0200
+Subject: [PATCH 12/34] E7b: l2norm q/k liczony w jadrze gated_delta_net
+ (op_params[2]=eps, [3]=1); env GGML_JOHNV8_GDN_L2
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h                   |  3 ++
+ ggml/src/ggml-cpu/ops.cpp             | 15 ++++++++++
+ ggml/src/ggml-cuda/gated_delta_net.cu | 41 +++++++++++++++++++++------
+ ggml/src/ggml.c                       |  7 +++++
+ src/models/delta-net-base.cpp         | 17 +++++++++++
+ src/models/models.h                   |  2 ++
+ src/models/qwen4exp.cpp               | 11 +++++--
+ 7 files changed, 85 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 166d3ee..df9744d 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2618,6 +2618,9 @@ extern "C" {
+             struct ggml_tensor  * dt,
+             struct ggml_tensor  * A);
+ 
++    // [johnv8] E7b: q i k normalizowane L2 (jak ggml_l2_norm, eps) wewnatrz jadra GDN
++    GGML_API void ggml_gated_delta_net_set_l2norm(struct ggml_tensor * gdn, float eps);
++
+     // DSA lightning indexer
+     //
+     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index c749389..b44802a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -10907,6 +10907,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     const bool    prolog = ggml_get_op_params_i32(dst, 1) != 0;
+     const float * pro_dt = prolog ? (const float *) dst->src[6]->data : nullptr;
+     const float * pro_a  = prolog ? (const float *) dst->src[7]->data : nullptr;
++    // [johnv8] E7b: l2norm q/k w operatorze (op_params[3]=1, eps w op_params[2])
++    const bool  l2_on  = ggml_get_op_params_i32(dst, 3) != 0;
++    const float l2_eps = ggml_get_op_params_f32(dst, 2);
+     ggml_tensor * src_state = dst->src[5];
+ 
+     const int64_t S_v      = src_v->ne[0];
+@@ -10995,6 +10998,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+         for (int64_t t = 0; t < n_tokens; t++) {
+             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
+             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
++            float qn_buf[256];
++            float kn_buf[256];
++            if (l2_on) {   // [johnv8] E7b: jak ggml_compute_forward_l2_norm_f32
++                GGML_ASSERT(S_v <= 256);
++                ggml_float sq = 0.0, sk = 0.0;
++                for (int64_t i = 0; i < S_v; ++i) { sq += (ggml_float)(q_d[i] * q_d[i]); sk += (ggml_float)(k_d[i] * k_d[i]); }
++                const float scq = 1.0f/fmaxf(sqrtf(sq), l2_eps);
++                const float sck = 1.0f/fmaxf(sqrtf(sk), l2_eps);
++                for (int64_t i = 0; i < S_v; ++i) { qn_buf[i] = q_d[i] * scq; kn_buf[i] = k_d[i] * sck; }
++                q_d = qn_buf;
++                k_d = kn_buf;
++            }
+             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+ 
+             float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 6a7d0ea..a2d46ab 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -10,6 +10,8 @@ gated_delta_net_cuda(const float * q,
+                                      const float * beta,
+                                      const float * pro_dt,
+                                      const float * pro_a,
++                                     const int     l2_on,
++                                     const float   l2_eps,
+                                      const float * curr_state,
+                                      float *       dst,
+                                      float *       state,
+@@ -85,6 +87,24 @@ gated_delta_net_cuda(const float * q,
+             k_reg[r] = k_t[i];
+             q_reg[r] = q_t[i];
+         }
++        if (l2_on) {   // [johnv8] E7b: l2_norm jak norm.cu (blok = warp, kolumny lane + r*warp_size, ta sama kolejnosc sum)
++            float tk = 0.0f;
++            float tq = 0.0f;
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                tk += k_reg[r] * k_reg[r];
++                tq += q_reg[r] * q_reg[r];
++            }
++            tk = warp_reduce_sum<warp_size>(tk);
++            tq = warp_reduce_sum<warp_size>(tq);
++            const float sk = rsqrtf(fmaxf(tk, l2_eps * l2_eps));
++            const float sq = rsqrtf(fmaxf(tq, l2_eps * l2_eps));
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                k_reg[r] = sk * k_reg[r];
++                q_reg[r] = sq * q_reg[r];
++            }
++        }
+ 
+         if constexpr (!KDA) {
+             float g_raw = *g_t;
+@@ -180,7 +200,7 @@ gated_delta_net_cuda(const float * q,
+ template <bool KDA, bool keep_rs_t>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+-        const float * g_d, const float * b_d, const float * pro_dt, const float * pro_a, const float * s_d,
++        const float * g_d, const float * b_d, const float * pro_dt, const float * pro_a, int l2_on, float l2_eps, const float * s_d,
+         float * dst_d, float * state_d,
+         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+         int64_t sq1,   int64_t sq2, int64_t sq3,
+@@ -201,26 +221,26 @@ static void launch_gated_delta_net(
+     switch (S_v) {
+         case 16:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 64: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         }
+         case 128: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d, H,
++                q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+@@ -270,6 +290,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     const float * pro_dt = prolog ? (const float *) dst->src[6]->data : nullptr;
+     const float * pro_a  = prolog ? (const float *) dst->src[7]->data : nullptr;
+     GGML_ASSERT(!prolog || src_g->ne[0] == 1);
++    // [johnv8] E7b: l2norm q/k w jadrze (op_params[3]=1, eps w op_params[2])
++    const int   l2_on  = ggml_get_op_params_i32(dst, 3);
++    const float l2_eps = ggml_get_op_params_f32(dst, 2);
+ 
+     const float * s_d   = (const float *) src_state->data;
+     float *       dst_d = (float *) dst->data;
+@@ -312,21 +335,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+ 
+     if (kda) {
+         if (keep_rs) {
+-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+     } else {
+         if (keep_rs) {
+-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, pro_dt, pro_a, l2_on, l2_eps, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index f7a4d4e..9037fd5 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6380,6 +6380,13 @@ struct ggml_tensor * ggml_gated_delta_net_prolog(
+     return result;
+ }
+ 
++void ggml_gated_delta_net_set_l2norm(struct ggml_tensor * gdn, float eps) {
++    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
++    GGML_ASSERT(eps >= 0.0f);
++    ggml_set_op_params_f32(gdn, 2, eps);
++    ggml_set_op_params_i32(gdn, 3, 1);
++}
++
+ // ggml_lightning_indexer
+ 
+ struct ggml_tensor * ggml_lightning_indexer(
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index d56aabb..1ac555d 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -402,6 +402,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+     ggml_tensor * result = gdn_prolog_dt
+         ? ggml_gated_delta_net_prolog(ctx0, q, k, v, g, b, s, /*K=*/1, gdn_prolog_dt, gdn_prolog_a)
+         : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
++    if (gdn_prolog_l2_eps >= 0.0f) {
++        ggml_gated_delta_net_set_l2norm(result, gdn_prolog_l2_eps);
++    }
+     if (n_tokens == 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+     } else {
+@@ -439,6 +442,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+             return build_delta_net_fused(q, k, v, g, b, s, il);
+         }
+         gdn_prolog_materialize(g, b);
++        gdn_prolog_materialize_qk(q, k);
+         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
+     }
+ 
+@@ -447,6 +451,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+     }
+ 
+     gdn_prolog_materialize(g, b);
++    gdn_prolog_materialize_qk(q, k);
+     return build_delta_net_chunking(q, k, v, g, b, s, il);
+ }
+ 
+@@ -462,6 +467,15 @@ void llm_build_delta_net_base::gdn_prolog_materialize(ggml_tensor *& g, ggml_ten
+     b  = ggml_sigmoid(ctx0, b);
+ }
+ 
++// [johnv8] E7b: sciezki bez fuzji dostaja l2norm q/k jawnie
++void llm_build_delta_net_base::gdn_prolog_materialize_qk(ggml_tensor *& q, ggml_tensor *& k) {
++    if (gdn_prolog_l2_eps < 0.0f) {
++        return;
++    }
++    q = ggml_l2_norm(ctx0, q, gdn_prolog_l2_eps);
++    k = ggml_l2_norm(ctx0, k, gdn_prolog_l2_eps);
++}
++
+ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+         llm_graph_input_rs * inp,
+         ggml_tensor *        conv_states_all,
+@@ -583,6 +597,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     ggml_tensor * gdn_out = gdn_prolog_dt
+         ? ggml_gated_delta_net_prolog(ctx0, q, k, v, g, b, s, K, gdn_prolog_dt, gdn_prolog_a)
+         : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    if (gdn_prolog_l2_eps >= 0.0f) {
++        ggml_gated_delta_net_set_l2norm(gdn_out, gdn_prolog_l2_eps);
++    }
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
+diff --git a/src/models/models.h b/src/models/models.h
+index a5d0031..9b86361 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -82,7 +82,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
+     // [johnv8] E7: gdy ustawione, GDN dostaje surowe alpha/beta i liczy prolog w jadrze
+     ggml_tensor * gdn_prolog_dt = nullptr;
+     ggml_tensor * gdn_prolog_a  = nullptr;
++    float         gdn_prolog_l2_eps = -1.0f;   // [johnv8] E7b: >= 0 -> l2norm q/k w jadrze
+     void gdn_prolog_materialize(ggml_tensor *& g, ggml_tensor *& b);
++    void gdn_prolog_materialize_qk(ggml_tensor *& q, ggml_tensor *& k);
+ 
+     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
+     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index ae913b8..17171f3 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1285,8 +1285,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+ 
+     const float eps_norm = hparams.f_norm_rms_eps;
+ 
+-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
++    // [johnv8] E7b: l2norm q/k liczony w jadrze GDN (GGML_JOHNV8_GDN_L2=0 przywraca osobne jadra)
++    static const bool gdn_l2 = []() { const char * e = getenv("GGML_JOHNV8_GDN_L2"); return e == nullptr || atoi(e) != 0; }();
++    const bool gdn_l2_in_kernel = gdn_l2 && gdn_prolog;
++    if (!gdn_l2_in_kernel) {
++        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
++        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
++    }
+ 
+     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
+     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+@@ -1301,9 +1306,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+ 
+     gdn_prolog_dt = gdn_prolog ? model.layers[il].ssm_dt : nullptr;
+     gdn_prolog_a  = gdn_prolog ? model.layers[il].ssm_a  : nullptr;
++    gdn_prolog_l2_eps = gdn_l2_in_kernel ? eps_norm : -1.0f;
+     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+     gdn_prolog_dt = nullptr;
+     gdn_prolog_a  = nullptr;
++    gdn_prolog_l2_eps = -1.0f;
+ 
+     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,780 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 548c80f..c8f6553 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1262,6 +1262,13 @@ struct ggml_cuda_graph {
+ #endif
+ };
+ 
++// [johnv8] E55: uogolniony fork/join na wielu strumieniach (qwen4exp, 1 i 2 GPU). GGML_JOHNV8_FORKJOIN=1, domyslnie OFF.
++// Gdy nasz env jest pusty, upstreamowy tryb GGML_CUDA_GRAPH_OPT dziala bez zmian.
++inline bool ggml_cuda_johnv8_forkjoin_enabled() {
++    static const bool on = []() { const char * e = getenv("GGML_JOHNV8_FORKJOIN"); return e != nullptr && atoi(e) != 0; }();
++    return on;
++}
++
+ struct ggml_cuda_concurrent_event {
+     std::vector<cudaEvent_t> join_events;
+     cudaEvent_t              fork_event = nullptr;
+@@ -1275,6 +1282,13 @@ struct ggml_cuda_concurrent_event {
+ 
+     const ggml_tensor * join_node;
+ 
++    // [johnv8] E55: liczba wezlow regionu (miedzy korzeniem a joinem); join_node == nullptr -> join na koncu grafu (splitu).
++    int    region_len  = 0;
++    // [johnv8] E55: region zbudowany przez nasz optymalizator (bez przestawiania, scisly test adresow).
++    bool   strict      = false;
++    // [johnv8] E55: wynik is_valid_strict() zalezy tylko od alokacji (nowa alokacja = nowy optimize = nowe zdarzenie) -> liczony raz.
++    int8_t valid_cache = -1;
++
+     ggml_cuda_concurrent_event() = default;
+ 
+     ggml_cuda_concurrent_event(const ggml_cuda_concurrent_event &) = delete;
+@@ -1296,10 +1310,58 @@ struct ggml_cuda_concurrent_event {
+     , n_streams(other.n_streams)
+     , stream_mapping(std::move(other.stream_mapping))
+     , original_order(std::move(other.original_order))
+-    , join_node(other.join_node) {
++    , join_node(other.join_node)
++    , region_len(other.region_len)
++    , strict(other.strict)
++    , valid_cache(other.valid_cache) {
+         other.fork_event = nullptr;
+     }
+ 
++    // [johnv8] E55: scisly test niezaleznosci galezi po ADRESACH (wolany po alokacji, przed odpaleniem strumieni):
++    //  zapis (wynik) wezla w strumieniu s nie moze nachodzic ani na zapis, ani na ODCZYT (src) wezla w innym strumieniu.
++    //  Upstreamowy is_valid() porownuje tylko wyniki galezi miedzy soba i nie widzi np. wyniku umieszczonego przez alokator
++    //  in-place na tensorze sprzed forka, ktory czyta rownolegle inna galaz. Widoki/reshape'y nic nie licza (pomijane).
++    //  Czasy zycia tensorow regionu wydluza optymalizator przez add_alloc_dep, wiec w praktyce test powinien przechodzic;
++    //  jesli nie - region wraca na jeden strumien (poprawnosc > szybkosc).
++    bool is_valid_strict() const {
++        struct rng { int64_t a, b; };
++        std::vector<std::vector<rng>> writes(n_streams), reads(n_streams);
++        const auto is_noop = [](const ggml_tensor * t) {
++            return ggml_is_empty(t) || t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
++                   t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE;
++        };
++        const auto range_of = [](const ggml_tensor * t, rng & r) -> bool {
++            if (t->data == nullptr) { return false; }
++            r.a = (int64_t) (intptr_t) t->data;
++            r.b = r.a + (int64_t) ggml_nbytes(t);
++            return true;
++        };
++        for (const auto & [t, s] : stream_mapping) {
++            if (s < 1 || s > n_streams) { return false; }
++            if (is_noop(t)) { continue; }
++            rng r;
++            if (!range_of(t, r)) { return false; }
++            writes[s - 1].push_back(r);
++            for (int k = 0; k < GGML_MAX_SRC; ++k) {
++                const ggml_tensor * src = t->src[k];
++                if (src == nullptr) { continue; }
++                if (!range_of(src, r)) { return false; }
++                reads[s - 1].push_back(r);
++            }
++        }
++        const auto overlap = [](const rng & x, const rng & y) { return x.a < y.b && y.a < x.b; };
++        for (int s = 0; s < n_streams; ++s) {
++            for (int o = 0; o < n_streams; ++o) {
++                if (o == s) { continue; }
++                for (const rng & w : writes[s]) {
++                    for (const rng & w2 : writes[o]) { if (overlap(w, w2)) { return false; } }
++                    for (const rng & r  : reads[o])  { if (overlap(w, r))  { return false; } }
++                }
++            }
++        }
++        return true;
++    }
++
+     // 1. check if any branches write to overlapping memory ranges (except the join node)
+     // 2. check whether all srcs are either within the branch or outside the nodes covered by ggml_cuda_concurrent_event
+     // we assume all nodes have the same buffer
+@@ -1599,6 +1661,10 @@ struct ggml_backend_cuda_context {
+     }
+ 
+     ggml_cuda_stream_context concurrent_stream_context;
++    // [johnv8] E55: kontekst strumieni per split (klucz = wskaznik cgraph, jak plan fuzji E11). Scheduler wola graph_optimize
++    // osobno dla kazdego splitu, a upstreamowy jeden kontekst zerowal sie przy kazdym wywolaniu - na 2 GPU albo z ekspertami
++    // na CPU backend dostaje wiele splitow na graf i forki wszystkich poza ostatnim ginely.
++    std::unordered_map<const ggml_cgraph *, ggml_cuda_stream_context> johnv8_stream_contexts;
+ 
+     ~ggml_backend_cuda_context();
+ 
+@@ -1614,6 +1680,14 @@ struct ggml_backend_cuda_context {
+ 
+     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+ 
++    // [johnv8] E55: w naszym trybie kontekst per split, inaczej upstreamowy (jeden na backend)
++    ggml_cuda_stream_context & stream_context(const ggml_cgraph * cgraph) {
++        if (ggml_cuda_johnv8_forkjoin_enabled()) {
++            return johnv8_stream_contexts[cgraph];
++        }
++        return concurrent_stream_context;
++    }
++
+     cublasHandle_t cublas_handle() {
+         if (cublas_handles[device][curr_stream_no] == nullptr) {
+             ggml_cuda_set_device(device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d374dd5..ff7b0af 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4321,7 +4321,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+ 
+-    ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
++    ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context(cgraph);   // [johnv8] E55: per split w naszym trybie
+     bool                         is_concurrent_event_active = false;
+     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
+     bool                         should_launch_concurrent_events = false;
+@@ -4345,6 +4345,78 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         }
+     };
+ 
++    // [johnv8] E55: tryb GGML_JOHNV8_FORKJOIN (patrz ggml_cuda_johnv8_forkjoin_optimize). Fork odpalamy na POCZATKU iteracji i,
++    // gdy nodes[i-1] jest korzeniem - niezaleznie od tego, czy korzen policzyl sie sam, w fuzji (hcblock B konczy sie na
++    // hc_mixed) czy jest widokiem; join po INDEKSIE (join_node == nullptr -> join na koncu grafu/splitu).
++    const bool       fj          = ggml_cuda_johnv8_forkjoin_enabled();
++    int              fj_join_idx = -1;   // indeks wezla join aktywnego regionu (== n_nodes: join na koncu grafu)
++    std::vector<int> fj_roots;           // indeksy korzeni forkow w tym grafie (rosnaco)
++    size_t           fj_root_cur = 0;
++    static int       fj_log_left = getenv("GGML_CUDA_DUMP_DISPATCH") != nullptr ? 32 : 0;
++
++    const auto fj_try_launch = [&](const int i) {
++        const ggml_tensor * root = cgraph->nodes[i - 1];
++        auto it = stream_ctx.concurrent_events.find(root);
++        if (it == stream_ctx.concurrent_events.end()) {
++            return;
++        }
++        const ggml_cuda_concurrent_event & ev = it->second;
++        const int join_idx = i + ev.region_len;
++        bool ok = join_idx <= cgraph->n_nodes &&
++                  (ev.join_node == nullptr ? join_idx == cgraph->n_nodes
++                                           : (join_idx < cgraph->n_nodes && cgraph->nodes[join_idx] == ev.join_node));
++        for (int k = i; ok && k < join_idx; ++k) {
++            ok = ev.stream_mapping.find(cgraph->nodes[k]) != ev.stream_mapping.end();
++        }
++        if (!ok) {
++            // graf nie pasuje do regionu (nie powinno sie zdarzyc: optimize i compute dostaja ten sam widok splitu)
++            if (fj_log_left > 0) {
++                fj_log_left--;
++                fprintf(stderr, "[johnv8-forkjoin] pomijam fork %s: region nie pasuje do grafu\n", root->name);
++            }
++            return;
++        }
++        fj_join_idx = join_idx;
++        try_launch_concurrent_event(root);
++    };
++
++    // join: zdarzenia na strumieniach bocznych, glowny strumien na nie czeka; dalej wszystko na strumieniu 0
++    const auto fj_join = [&]() {
++        GGML_ASSERT(concurrent_event);
++        cuda_ctx->curr_stream_no = 0;
++        for (int s = 1; s <= concurrent_event->n_streams; ++s) {
++            CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[s - 1], cuda_ctx->stream(cuda_ctx->device, s)));
++            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[s - 1]));
++        }
++        is_concurrent_event_active = false;
++        concurrent_event           = nullptr;
++        fj_join_idx                = -1;
++    };
++
++    // Fuzja nie moze przekroczyc ani korzenia forka (fork odpala sie tuz po korzeniu), ani joina (join synchronizuje
++    // strumienie PRZED wezlem join; np. E6b sigmoid|mul|add z joinem na mul poszloby na strumieniu galezi bez czekania).
++    // Na czas matcherow przycinamy n_nodes - wszystkie matchery (upstream i johnv8) sprawdzaja granice przez cgraph->n_nodes.
++    // Wzorce konczace sie DOKLADNIE na korzeniu (hcblock B, hc-mix -> hc_mixed) zostaja.
++    const auto fj_try_fuse = [&](const int i) -> int {
++        if (!fj) {
++            return ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++        }
++        const int saved = cgraph->n_nodes;
++        if (is_concurrent_event_active) {
++            cgraph->n_nodes = fj_join_idx;
++        } else {
++            while (fj_root_cur < fj_roots.size() && fj_roots[fj_root_cur] < i) {
++                fj_root_cur++;
++            }
++            if (fj_root_cur < fj_roots.size()) {
++                cgraph->n_nodes = fj_roots[fj_root_cur] + 1;
++            }
++        }
++        const int r = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++        cgraph->n_nodes = saved;
++        return r;
++    };
++
+     while (!graph_evaluated_or_captured) {
+         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
+         // With the use of CUDA graphs, the execution will be performed by the graph launch.
+@@ -4352,13 +4424,47 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             [[maybe_unused]] int prev_i = 0;
+ 
+             if (stream_ctx.concurrent_events.size() > 0) {
+-                should_launch_concurrent_events = true;
+-                for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
+-                    should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
++                if (fj) {
++                    // [johnv8] E55: kazdy fork sprawdzamy osobno scislym testem adresow (po alokacji); niepoprawne usuwamy,
++                    // reszta dziala. Wynik buforowany w zdarzeniu (alokacja zmienia sie tylko razem z optimize).
++                    for (auto it = stream_ctx.concurrent_events.begin(); it != stream_ctx.concurrent_events.end(); ) {
++                        ggml_cuda_concurrent_event & ev = it->second;
++                        if (ev.valid_cache < 0) {
++                            ev.valid_cache = (ev.strict ? ev.is_valid_strict() : ev.is_valid()) ? 1 : 0;
++                        }
++                        if (ev.valid_cache == 0) {
++                            if (fj_log_left > 0) {
++                                fj_log_left--;
++                                fprintf(stderr, "[johnv8-forkjoin] fork %s odrzucony po alokacji (nachodzace adresy miedzy strumieniami)\n", it->first->name);
++                            }
++                            it = stream_ctx.concurrent_events.erase(it);
++                        } else {
++                            ++it;
++                        }
++                    }
++                    should_launch_concurrent_events = !stream_ctx.concurrent_events.empty();
++                } else {
++                    should_launch_concurrent_events = true;
++                    for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
++                        should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
++                    }
+                 }
+             }
+ 
+-            if (should_launch_concurrent_events) {
++            if (fj) {
++                // [johnv8] E55: nic nie przestawialismy, wiec nic nie odtwarzamy; tylko lista korzeni do przyciecia fuzji
++                fj_roots.clear();
++                fj_root_cur = 0;
++                if (should_launch_concurrent_events) {
++                    for (int i = 0; i < cgraph->n_nodes; ++i) {
++                        if (stream_ctx.concurrent_events.find(cgraph->nodes[i]) != stream_ctx.concurrent_events.end()) {
++                            fj_roots.push_back(i);
++                        }
++                    }
++                } else {
++                    stream_ctx.concurrent_events.clear();
++                }
++            } else if (should_launch_concurrent_events) {
+                 // Restore original node order within each concurrent region to enable fusion within streams
+ 
+                 std::unordered_map<const ggml_tensor *, int> node_to_idx;
+@@ -4433,7 +4539,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+-                if (is_concurrent_event_active) {
++                if (fj) {
++                    // [johnv8] E55: fork po korzeniu (nodes[i-1]), join po indeksie
++                    if (!is_concurrent_event_active && i > 0) {
++                        fj_try_launch(i);
++                    }
++                    if (is_concurrent_event_active) {
++                        if (i == fj_join_idx) {
++                            fj_join();
++                        } else {
++                            auto it = concurrent_event->stream_mapping.find(node);
++                            GGML_ASSERT(it != concurrent_event->stream_mapping.end());   // sprawdzone w fj_try_launch
++                            cuda_ctx->curr_stream_no = it->second;
++                        }
++                    }
++                } else if (is_concurrent_event_active) {
+                     GGML_ASSERT(concurrent_event);
+ 
+                     if (node == concurrent_event->join_node) {
+@@ -4495,11 +4615,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     if (johnv8_plan_ok && P.skip[i] == -1) {
+                         cuda_ctx->fuse_plan_skipped++;
+                     } else {
+-                        nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++                        nodes_to_skip = fj_try_fuse(i);   // [johnv8] E55: = ggml_cuda_try_fuse, z przycieciem do korzenia/joina
+                         if (johnv8_plan_ok) { cuda_ctx->fuse_plan_probed++; if (nodes_to_skip == 0) { P.skip[i] = -1; } }
+                     }
+                 } else {
+-                    nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++                    nodes_to_skip = fj_try_fuse(i);
+                 }
+                 if (johnv8_timing) {
+                     johnv8_t_fuse += ggml_time_us() - johnv8_t0;
+@@ -4559,11 +4679,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 }
+                 GGML_ASSERT(ok);
+ 
+-                if (!is_concurrent_event_active) {
++                if (!fj && !is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+                }
+             }
+ 
++            // [johnv8] E55: join na koncu grafu (join_node == nullptr) albo siatka bezpieczenstwa - strumien glowny musi
++            // zebrac strumienie boczne przed koncem przechwytywania grafu i przed zdarzeniami schedulera
++            if (fj && is_concurrent_event_active) {
++                fj_join();
++            }
++
+             // [johnv8-TMP] USUNAC razem z reszta zrzutu
+             if (johnv8_dump) {
+                 fprintf(stderr, "[johnv8-dump] dispatchy=%d na %d wezlow\n", johnv8_disp, cgraph->n_nodes);
+@@ -4709,6 +4835,433 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+     }
+ }
+ 
++// [johnv8] E55: uogolniony fork/join na wielu strumieniach HIP (GGML_JOHNV8_FORKJOIN=1, domyslnie OFF).
++// Roznice wzgledem upstreamowego GGML_CUDA_GRAPH_OPT (ktory zostaje bez zmian, gdy nasz env jest pusty):
++//  - dziala per backend/split (kontekst strumieni per wskaznik cgraph; split jest zawsze jednourzadzeniowy), wiec takze na
++//    2 GPU i z ekspertami na CPU; zdarzenia HIP tworzymy po ggml_cuda_set_device(urzadzenie backendu);
++//  - korzenie: nazwa zawiera jeden z GGML_JOHNV8_FORKJOIN_NAMES (domyslnie attn_norm,ffn_norm,hc_norm,hc_mixed),
++//    fan-out w GGML_JOHNV8_FORKJOIN_FANOUT (domyslnie "2,6"); liczymy konsumentow do GGML_JOHNV8_FORKJOIN_MAXROWS wierszy
++//    (domyslnie 16 - upstream liczy tylko 1 wiersz, a dekod z draftem MTP ma 2-4 tokeny; prompt ub 512 nie forkuje);
++//  - galezie: konsument korzenia zalezny od istniejacej galezi DOLACZA do niej (eksperci MoE czytaja korzen i ids routera,
++//    upstream zrobilby z tego join i odrzucil region przez niezgodna liczbe wezlow); wezel zalezny od >= 2 galezi konczy region
++//    (join); wyjatek: dokladnie 2 galezie, kazda z <= GGML_JOHNV8_FORKJOIN_MERGE (1) realnych wezlow (gate/up eksperta
++//    wspoldzielonego) -> scalamy je w jedna i region trwa dalej; region moze konczyc sie z grafem/splitem (join_node == nullptr,
++//    GGML_JOHNV8_FORKJOIN_ENDJOIN=0 wylacza) - eksperci na CPU tna split zaraz za routerem;
++//  - join cofamy o max GGML_JOHNV8_FORKJOIN_PULLBACK (2) tanich wezlow zasilajacych join, by nie rozbic fuzji ogona
++//    (E6b sigmoid|mul|add: join na mul -> cofniety na sigmoid, cala trojka na strumieniu glownym); niezaleznie od tego petla
++//    eval nie pozwala fuzji przekroczyc korzenia ani joina (przyciecie n_nodes na czas matcherow);
++//  - ZADNEGO przestawiania wezlow: czasy zycia wynikow regionu i ich zrodel spoza regionu wydluza add_alloc_dep do ostatniego
++//    wezla regionu, wiec alokator niczego nie nalozy ani nie zrobi in-place, a wzorce fuzji (hc-mix, hc-combine, hcblock,
++//    shexp-tail, gdn cache, moe reduction, topk) zostaja ciagle; upstream interleave'owal i odtwarzal kolejnosc w compute;
++//  - test po alokacji: is_valid_strict (zapisy vs zapisy I ODCZYTY miedzy strumieniami), nie upstreamowy is_valid;
++//  - tylko regiony najbardziej wewnetrzne: region zawierajacy korzen innego regionu odpada (hc_norm obejmowalby caly blok
++//    uwagi z hc_mixed w srodku i jedna galaz z hc_inject);
++//  - wymagane HIP graphs jak w upstreamie (GGML_JOHNV8_FORKJOIN_NOGRAPH=1 pozwala tez bez);
++//  - GGML_CUDA_DUMP_DISPATCH=1: jednorazowe podsumowanie (forki/graf, strumienie) dla pierwszych grafow z forkami.
++// Uwaga: dedup kwantyzacji q8 (E6d) jest wylaczony wewnatrz regionu (mmvq.cu), bo bufor cache jest wspolny dla strumieni.
++// Numeryka: bez zmian - te same jadra, ten sam podzial pracy, tylko na innych strumieniach; kazdy wezel ma wlasny wynik.
++struct johnv8_forkjoin_cfg {
++    std::vector<std::string> names;
++    int  min_fan_out = 2;
++    int  max_fan_out = 6;
++    int  max_rows    = 16;
++    int  merge_max   = 1;
++    int  pullback    = 2;
++    bool need_graph  = true;
++    bool end_join    = true;
++    bool dump        = false;
++
++    static const johnv8_forkjoin_cfg & get() {
++        static const johnv8_forkjoin_cfg cfg = []() {
++            johnv8_forkjoin_cfg c;
++            const char * e = getenv("GGML_JOHNV8_FORKJOIN_NAMES");
++            const std::string names = e != nullptr ? e : "attn_norm,ffn_norm,hc_norm,hc_mixed";
++            size_t pos = 0;
++            while (pos <= names.size()) {
++                size_t nx = names.find(',', pos);
++                if (nx == std::string::npos) { nx = names.size(); }
++                if (nx > pos) { c.names.push_back(names.substr(pos, nx - pos)); }
++                pos = nx + 1;
++            }
++            if ((e = getenv("GGML_JOHNV8_FORKJOIN_FANOUT")) != nullptr) {
++                int a = 0, b = 0;
++                if (sscanf(e, "%d,%d", &a, &b) == 2 && a >= 2 && b >= a) { c.min_fan_out = a; c.max_fan_out = b; }
++            }
++            if ((e = getenv("GGML_JOHNV8_FORKJOIN_MAXROWS")) != nullptr && atoi(e) > 0) { c.max_rows = atoi(e); }
++            if ((e = getenv("GGML_JOHNV8_FORKJOIN_MERGE")) != nullptr) { c.merge_max = std::max(0, atoi(e)); }
++            if ((e = getenv("GGML_JOHNV8_FORKJOIN_PULLBACK")) != nullptr) { c.pullback = std::max(0, atoi(e)); }
++            if ((e = getenv("GGML_JOHNV8_FORKJOIN_NOGRAPH")) != nullptr && atoi(e) != 0) { c.need_graph = false; }
++            if ((e = getenv("GGML_JOHNV8_FORKJOIN_ENDJOIN")) != nullptr && atoi(e) == 0) { c.end_join = false; }
++            c.dump = getenv("GGML_CUDA_DUMP_DISPATCH") != nullptr;
++            return c;
++        }();
++        return cfg;
++    }
++};
++
++static void ggml_cuda_johnv8_forkjoin_optimize(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
++                                               ggml_backend_graph_optimize_params * params, const bool use_cuda_graph) {
++    const johnv8_forkjoin_cfg & cfg = johnv8_forkjoin_cfg::get();
++    ggml_cuda_stream_context &  sc  = cuda_ctx->stream_context(cgraph);
++    sc.reset();
++
++    if (cfg.need_graph && !use_cuda_graph) {
++        return;
++    }
++    const int n = cgraph->n_nodes;
++    if (n < 3) {
++        return;
++    }
++    // zdarzenia HIP powstaja na biezacym urzadzeniu - musi to byc urzadzenie tego backendu (2 GPU)
++    ggml_cuda_set_device(cuda_ctx->device);
++
++    const auto is_noop = [](const ggml_tensor * t) -> bool {
++        return ggml_is_empty(t) || t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE ||
++               t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE;
++    };
++    const auto base_of = [](const ggml_tensor * t) -> const ggml_tensor * { return t->view_src ? t->view_src : t; };
++    // jak w upstreamie: zaleznosc przez src albo przez wspolny tensor bazowy widoku (np. cache KV / stanu SSM)
++    const auto depends_on = [&](const ggml_tensor * dst, const ggml_tensor * src) -> bool {
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (dst->src[s] == src) {
++                return true;
++            }
++        }
++        return base_of(dst) == base_of(src);
++    };
++    const auto name_ok = [&](const char * name) -> bool {
++        for (const std::string & s : cfg.names) {
++            if (strstr(name, s.c_str()) != nullptr) {
++                return true;
++            }
++        }
++        return false;
++    };
++
++    std::unordered_map<const ggml_tensor *, int> node_idx;
++    node_idx.reserve(n);
++    for (int i = 0; i < n; ++i) {
++        node_idx[cgraph->nodes[i]] = i;
++    }
++
++    // fan-out: ilu realnych (i dostatecznie malych) konsumentow ma dany tensor
++    std::unordered_map<const ggml_tensor *, int> fan_out;
++    for (int i = 0; i < n; ++i) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        if (is_noop(node) || ggml_nrows(node) > cfg.max_rows) {
++            continue;
++        }
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (node->src[s] != nullptr) {
++                fan_out[node->src[s]] += 1;
++            }
++        }
++    }
++
++    std::vector<std::pair<int, const ggml_tensor *>> cands;
++    for (const auto & [t, cnt] : fan_out) {
++        if (cnt < cfg.min_fan_out || cnt > cfg.max_fan_out) {
++            continue;
++        }
++        auto it = node_idx.find(t);
++        if (it == node_idx.end() || !name_ok(t->name)) {
++            continue;   // lisc (waga/wejscie) albo obca nazwa
++        }
++        cands.emplace_back(it->second, t);
++    }
++    std::sort(cands.begin(), cands.end());
++
++    struct region {
++        int root_idx = -1;
++        int join_idx = -1;
++        const ggml_tensor * root      = nullptr;
++        const ggml_tensor * join_node = nullptr;
++        std::vector<std::vector<const ggml_tensor *>> branches;
++        std::vector<int> n_real;
++    };
++
++    const auto build_region = [&](const int root_idx, const ggml_tensor * root, region & R) -> bool {
++        std::vector<std::vector<const ggml_tensor *>> br;   // galezie (id = indeks)
++        std::vector<int> alias;                              // scalanie galezi: alias[b] -> reprezentant
++        std::vector<int> n_real;                             // realne (nie-widokowe) wezly w galezi
++        std::unordered_map<const ggml_tensor *, int> of;                    // wezel regionu -> galaz
++        std::unordered_map<const ggml_tensor *, std::vector<int>> by_base;  // tensor bazowy -> galezie z jego widokami
++        std::vector<const ggml_tensor *> free_noops;                        // widoki bez galezi (cache, wagi)
++
++        const auto find = [&](int b) { while (alias[b] != b) { b = alias[b]; } return b; };
++        const auto add_to = [&](int b, const ggml_tensor * t, bool real) {
++            br[b].push_back(t);
++            of[t] = b;
++            // tylko realne wezly zapisuja pamiec (np. set_rows/cpy do cache = widok cache); widoki wag/cache nie
++            if (real) { n_real[b]++; by_base[base_of(t)].push_back(b); }
++        };
++        const auto new_branch = [&](const ggml_tensor * t, bool real) {
++            const int b = (int) br.size();
++            br.emplace_back();
++            alias.push_back(b);
++            n_real.push_back(0);
++            add_to(b, t, real);
++            return b;
++        };
++        const auto take_free = [&](const ggml_tensor * f, int b) {
++            free_noops.erase(std::find(free_noops.begin(), free_noops.end(), f));
++            add_to(b, f, false);
++        };
++
++        int join_idx = -1;
++        const ggml_tensor * join_node = nullptr;
++        for (int i = root_idx + 1; i < n; ++i) {
++            const ggml_tensor * node = cgraph->nodes[i];
++            std::vector<int> memb;   // galezie, od ktorych zalezy wezel
++            const auto note = [&](int b) {
++                b = find(b);
++                if (std::find(memb.begin(), memb.end(), b) == memb.end()) { memb.push_back(b); }
++            };
++            std::vector<const ggml_tensor *> used_free;
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * src = node->src[s];
++                if (src == nullptr) {
++                    continue;
++                }
++                auto it = of.find(src);
++                if (it != of.end()) {
++                    note(it->second);
++                } else if (std::find(free_noops.begin(), free_noops.end(), src) != free_noops.end()) {
++                    used_free.push_back(src);
++                }
++                // zrodlo bedace widokiem tensora, do ktorego pisze jakas galaz (np. widok cache KV/stanu SSM utworzony
++                // przed regionem) -> zaleznosc od tej galezi
++                if (src->view_src != nullptr) {
++                    auto bb = by_base.find(src->view_src);
++                    if (bb != by_base.end()) {
++                        for (int b : bb->second) { note(b); }
++                    }
++                }
++            }
++            if (node->view_src != nullptr) {
++                auto it = by_base.find(node->view_src);
++                if (it != by_base.end()) {
++                    for (int b : it->second) { note(b); }
++                }
++            }
++            const bool noop = is_noop(node);
++
++            if (memb.size() >= 2) {
++                bool merge = cfg.merge_max > 0 && memb.size() == 2 && !noop;
++                for (int b : memb) { merge = merge && n_real[b] <= cfg.merge_max; }
++                if (merge) {
++                    // po scaleniu musza zostac >= 2 galezie z realna praca (scalenie dwoch realnych zabiera jedna)
++                    int live = 0;
++                    for (int b = 0; b < (int) br.size(); ++b) {
++                        if (find(b) == b && n_real[b] > 0) { live++; }
++                    }
++                    const int lost = (n_real[memb[0]] > 0 && n_real[memb[1]] > 0) ? 1 : 0;
++                    merge = live - lost >= 2;
++                }
++                if (!merge) {
++                    join_idx  = i;
++                    join_node = node;
++                    break;
++                }
++                const int a = memb[0], b = memb[1];
++                alias[b] = a;
++                n_real[a] += n_real[b];
++                memb.assign(1, a);
++            }
++
++            if (memb.size() == 1) {
++                const int b = memb[0];
++                for (const ggml_tensor * f : used_free) { take_free(f, b); }
++                add_to(b, node, !noop);
++            } else if (noop) {
++                if (depends_on(node, root)) {
++                    const int b = new_branch(node, false);   // np. reshape korzenia - jego konsument dolaczy tutaj
++                    for (const ggml_tensor * f : used_free) { take_free(f, b); }
++                } else {
++                    free_noops.push_back(node);
++                }
++            } else {
++                // konsument korzenia -> nowa galaz; wezel niezalezny (czyta tylko tensory sprzed regionu) tez moze isc na
++                // osobny strumien (nadmiar strumieni skladamy przy tworzeniu zdarzenia)
++                const int b = new_branch(node, true);
++                for (const ggml_tensor * f : used_free) { take_free(f, b); }
++            }
++        }
++
++        if (join_idx < 0) {
++            if (!cfg.end_join) {
++                return false;
++            }
++            join_idx  = n;
++            join_node = nullptr;
++        }
++
++        // normalizacja po scaleniach; wezly w kolejnosci grafu
++        std::vector<int> id_map(br.size(), -1);
++        std::vector<std::vector<const ggml_tensor *>> out;
++        std::vector<int> out_real;
++        for (int b = 0; b < (int) br.size(); ++b) {
++            const int r = find(b);
++            if (id_map[r] < 0) {
++                id_map[r] = (int) out.size();
++                out.emplace_back();
++                out_real.push_back(0);
++            }
++        }
++        if (out.empty()) {
++            return false;
++        }
++        for (int i = root_idx + 1; i < join_idx; ++i) {
++            const ggml_tensor * node = cgraph->nodes[i];
++            auto it = of.find(node);
++            if (it == of.end()) {
++                out[0].push_back(node);   // wolny widok bez konsumenta w regionie - nie liczy sie, ale musi miec strumien
++                continue;
++            }
++            const int o = id_map[find(it->second)];
++            out[o].push_back(node);
++            if (!is_noop(node)) { out_real[o]++; }
++        }
++
++        // cofniecie joina o tanie wezly zasilajace join (fuzje ogona, np. E6b sigmoid|mul|add)
++        int pulled = 0;
++        while (join_node != nullptr && pulled < cfg.pullback && join_idx - 1 > root_idx) {
++            const ggml_tensor * prev = cgraph->nodes[join_idx - 1];
++            const bool cheap = is_noop(prev) || prev->op == GGML_OP_UNARY || prev->op == GGML_OP_SCALE ||
++                               prev->op == GGML_OP_MUL || prev->op == GGML_OP_ADD || prev->op == GGML_OP_GLU;
++            bool feeds = is_noop(prev);
++            for (int s = 0; s < GGML_MAX_SRC && !feeds; ++s) { feeds = join_node->src[s] == prev; }
++            if (!cheap || !feeds) {
++                break;
++            }
++            for (size_t o = 0; o < out.size(); ++o) {
++                auto it = std::find(out[o].begin(), out[o].end(), prev);
++                if (it != out[o].end()) {
++                    out[o].erase(it);
++                    if (!is_noop(prev)) { out_real[o]--; }
++                    break;
++                }
++            }
++            join_idx--;
++            join_node = prev;
++            if (!is_noop(prev)) { pulled++; }
++        }
++
++        // galezie bez realnej pracy skladamy do pierwszej realnej (nie marnujemy strumieni); wymagamy >= 2 realnych
++        std::vector<std::vector<const ggml_tensor *>> fin;
++        std::vector<int> fin_real;
++        std::vector<const ggml_tensor *> idle;
++        for (size_t o = 0; o < out.size(); ++o) {
++            if (out_real[o] > 0) {
++                fin.push_back(std::move(out[o]));
++                fin_real.push_back(out_real[o]);
++            } else {
++                idle.insert(idle.end(), out[o].begin(), out[o].end());
++            }
++        }
++        if (fin.size() < 2) {
++            return false;
++        }
++        fin[0].insert(fin[0].end(), idle.begin(), idle.end());
++
++        R.root_idx  = root_idx;
++        R.join_idx  = join_idx;
++        R.root      = root;
++        R.join_node = join_node;
++        R.branches  = std::move(fin);
++        R.n_real    = std::move(fin_real);
++        return true;
++    };
++
++    std::vector<region> regions;
++    for (const auto & [idx, root] : cands) {
++        region R;
++        if (build_region(idx, root, R)) {
++            regions.push_back(std::move(R));
++        }
++    }
++
++    // tylko najbardziej wewnetrzne: region zawierajacy korzen innego regionu odpada; potem zachlannie bez nakladania
++    std::vector<char> take(regions.size(), 1);
++    for (size_t a = 0; a < regions.size(); ++a) {
++        for (size_t b = 0; b < regions.size() && take[a]; ++b) {
++            if (a != b && regions[b].root_idx > regions[a].root_idx && regions[b].root_idx < regions[a].join_idx) {
++                take[a] = 0;
++            }
++        }
++    }
++
++    int         last_end = -1;   // regiony sa posortowane po root_idx (cands posortowane)
++    int         n_forks = 0, n_streams_total = 0;
++    std::string summary;
++    for (size_t a = 0; a < regions.size(); ++a) {
++        region & R = regions[a];
++        if (!take[a] || R.root_idx < last_end) {   // korzen == join poprzedniego regionu jest OK: join na wezle, fork tuz za nim
++            continue;
++        }
++
++        const int max_streams = GGML_CUDA_MAX_STREAMS - 1;
++        const int n_streams   = std::min((int) R.branches.size(), max_streams);
++        ggml_cuda_concurrent_event ev(n_streams);
++        ev.join_node  = R.join_node;
++        ev.region_len = R.join_idx - R.root_idx - 1;
++        ev.strict     = true;
++        for (size_t b = 0; b < R.branches.size(); ++b) {
++            const int stream = std::min((int) b, n_streams - 1) + 1;   // nadmiar galezi -> ostatni strumien (galezie sa niezalezne)
++            for (const ggml_tensor * t : R.branches[b]) {
++                ev.stream_mapping[t] = stream;
++            }
++        }
++        bool complete = (int) ev.stream_mapping.size() == ev.region_len;
++        for (int i = R.root_idx + 1; complete && i < R.join_idx; ++i) {
++            complete = ev.stream_mapping.count(cgraph->nodes[i]) != 0;
++        }
++        if (!complete) {
++            continue;
++        }
++
++        // czasy zycia: wyniki regionu i ich zrodla spoza regionu zyja do ostatniego wezla regionu -> alokator nie polozy
++        // wyniku jednej galezi na tym, co rownolegle czyta inna (ani in-place na korzeniu / tensorze sprzed forka)
++        ggml_tensor * until = cgraph->nodes[R.join_idx - 1];
++        const auto keep = [&](const ggml_tensor * t) {
++            if (t->buffer != nullptr || ggml_is_empty(t)) {
++                return;   // wagi / cache sa juz zaalokowane - alokator grafu ich nie rusza
++            }
++            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t), until);
++        };
++        for (const auto & [t, s] : ev.stream_mapping) {
++            keep(t);
++            for (int k = 0; k < GGML_MAX_SRC; ++k) {
++                if (t->src[k] != nullptr && ev.stream_mapping.count(t->src[k]) == 0) {
++                    keep(t->src[k]);
++                }
++            }
++        }
++
++        if (cfg.dump) {
++            char buf[320];
++            snprintf(buf, sizeof(buf), "  fork %-28s idx=%-5d galezie=%d strumienie=%d region=%-3d join=%s\n",
++                     R.root->name, R.root_idx, (int) R.branches.size(), n_streams, ev.region_len,
++                     R.join_node != nullptr ? R.join_node->name : "<koniec grafu>");
++            summary += buf;
++        }
++        sc.concurrent_events.emplace(R.root, std::move(ev));
++        last_end = R.join_idx;
++        n_forks++;
++        n_streams_total += n_streams;
++    }
++
++    if (cfg.dump) {
++        static int left = 8;   // jednorazowe podsumowanie: pierwsze grafy (splity) z forkami
++        if (n_forks > 0 && left > 0) {
++            left--;
++            fprintf(stderr, "[johnv8-forkjoin] graf %p n_nodes=%d urzadzenie=%d: %d fork(ow), srednio %.1f strumieni bocznych/fork, kandydatow=%d, regionow=%d\n%s",
++                    (const void *) cgraph, n, cuda_ctx->device, n_forks, (double) n_streams_total / n_forks,
++                    (int) cands.size(), (int) regions.size(), summary.c_str());
++        }
++    }
++}
++
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+@@ -4743,6 +5296,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     GGML_UNUSED(cgraph);
+ #endif
+ 
++    // [johnv8] E55: nasz tryb ma pierwszenstwo; bez GGML_JOHNV8_FORKJOIN sciezka upstreamowa (GGML_CUDA_GRAPH_OPT) bez zmian
++    if (ggml_cuda_johnv8_forkjoin_enabled()) {
++        ggml_cuda_johnv8_forkjoin_optimize(cuda_ctx, cgraph, params, use_cuda_graph);
++        return;
++    }
++
+     static bool enable_graph_optimization = [] {
+         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
+         return env != nullptr && atoi(env) == 1;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 33c3ece..1e76129 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1474,7 +1474,9 @@ void ggml_cuda_mul_mat_vec_q(
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+         // [johnv8] E6d: to samo wejscie skwantyzowane w tym grafie -> uzyj ponownie (bit-exact)
+-        const bool dedup = johnv8_q8_dedup_enabled();
++        // [johnv8] E55: wewnatrz regionu fork/join (strumien != 0) bez dedupu - bufor cache q8 jest wspolny dla strumieni,
++        // a galezie kwantyzuja to samo wejscie (korzen) rownolegle na roznych strumieniach
++        const bool dedup = johnv8_q8_dedup_enabled() && ctx.curr_stream_no == 0;
+         char * cached = dedup ? ctx.q8cache.find(src1, q8_bytes) : nullptr;
+         if (cached != nullptr) {
+             src1_q8_1 = cached;

@@ -1,0 +1,56 @@
+From 0d4d626b77ee4809f7fd291c97c4d87e933cb9d5 Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 02:16:16 +0200
+Subject: [PATCH 31/34] =?UTF-8?q?E11:=20sygnatura=20wezla=20w=20planie=20f?=
+ =?UTF-8?q?uzji=20(op,=20ne,=20src0/src1,=20data)=20=E2=80=94=20prompt=20i?=
+ =?UTF-8?q?=20dekod=20dziela=20adresy=20wezlow?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   | 12 +++++++++---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  2 +-
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 9dae540..548c80f 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1501,10 +1501,16 @@ struct johnv8_hcb_scratch {
+ // skip[i] == -1 -> dla tego wezla try_fuse zwrocil 0 -> nastepnym razem pomijamy matchery. Uniewaznienie: inny graf,
+ // inna liczba wezlow, inny wskaznik wezla na pozycji i, oraz okresowo (co 2000 grafow) pelne odswiezenie.
+ struct johnv8_fuse_plan {
+-    const ggml_cgraph * graph = nullptr; int n_nodes = 0; uint64_t graphs = 0, skipped = 0, probed = 0;
+-    std::vector<const ggml_tensor *> nodes; std::vector<int8_t> skip;
++    // sygnatura wezla: ten sam adres tensora moze w innym grafie (prompt vs dekod) miec inne ksztalty/zrodla
++    struct sig { const ggml_tensor * t = nullptr; int op = 0; int64_t ne0 = 0, ne1 = 0, ne2 = 0, ne3 = 0; const ggml_tensor * s0 = nullptr; const ggml_tensor * s1 = nullptr; const void * data = nullptr;
++        static sig of(const ggml_tensor * n) { sig x; x.t = n; x.op = (int) n->op; x.ne0 = n->ne[0]; x.ne1 = n->ne[1]; x.ne2 = n->ne[2]; x.ne3 = n->ne[3]; x.s0 = n->src[0]; x.s1 = n->src[1]; x.data = n->data; return x; }
++        bool same(const ggml_tensor * n) const { return t == n && op == (int) n->op && ne0 == n->ne[0] && ne1 == n->ne[1] && ne2 == n->ne[2] && ne3 == n->ne[3] && s0 == n->src[0] && s1 == n->src[1] && data == n->data; }
++    };
++    const ggml_cgraph * graph = nullptr; int n_nodes = 0; uint64_t graphs = 0;
++    std::vector<sig> nodes; std::vector<int8_t> skip;
+     void reset(const ggml_cgraph * g) {
+-        graph = g; n_nodes = g->n_nodes; nodes.assign(g->nodes, g->nodes + g->n_nodes); skip.assign(g->n_nodes, 0);
++        graph = g; n_nodes = g->n_nodes; nodes.resize(g->n_nodes); skip.assign(g->n_nodes, 0);
++        for (int i = 0; i < g->n_nodes; ++i) { nodes[i] = sig::of(g->nodes[i]); }
+     }
+ };
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 23c481b..d374dd5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4490,7 +4490,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         if (cuda_ctx->fuse_plans.size() > 512) { cuda_ctx->fuse_plans.clear(); cuda_ctx->fuse_plan_cur = &cuda_ctx->fuse_plans[cgraph]; cuda_ctx->fuse_plan_cur->reset(cgraph); }
+                     }
+                     auto & P = *cuda_ctx->fuse_plan_cur;
+-                    if (P.n_nodes == cgraph->n_nodes && P.nodes[i] != node) { P.nodes[i] = node; P.skip[i] = 0; }
++                    if (P.n_nodes == cgraph->n_nodes && !P.nodes[i].same(node)) { P.nodes[i] = johnv8_fuse_plan::sig::of(node); P.skip[i] = 0; }
+                     johnv8_plan_ok = P.n_nodes == cgraph->n_nodes;
+                     if (johnv8_plan_ok && P.skip[i] == -1) {
+                         cuda_ctx->fuse_plan_skipped++;
+-- 
+2.43.0
+

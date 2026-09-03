@@ -1,0 +1,33 @@
+From ab91e50dbd7eb2f38e9d727367572fb4ad62aeaa Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 01:26:28 +0200
+Subject: [PATCH 25/34] =?UTF-8?q?E10c=20domyslnie=20OFF:=20pod=20MTP=20jad?=
+ =?UTF-8?q?ro=20A=2055=20us/launch=20(10=20blokow,=20redundantne=20normy)?=
+ =?UTF-8?q?=20=E2=80=94=20wolniej=20niz=20stock;=20do=20refaktoru?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/hc-block.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-block.cu b/ggml/src/ggml-cuda/hc-block.cu
+index e1a8e0e..197b19a 100644
+--- a/ggml/src/ggml-cuda/hc-block.cu
++++ b/ggml/src/ggml-cuda/hc-block.cu
+@@ -12,7 +12,9 @@
+ 
+ // GGML_JOHNV8_HCBLOCK: 0 = wylaczone, 1 = oba jadra (domyslnie), 2 = tylko A, 3 = tylko B (diagnostyka)
+ static int ggml_cuda_hcblock_mode() {
+-    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 1 : atoi(e); }();
++    // domyslnie OFF: pod MTP (nt=4) jadro A ma za malo blokow (10) i liczy normy/kwantyzacje 10x -> 55 us/launch,
++    // wolniej niz stock (E25/E32). Do czasu refaktoru (A0/A1/B1) wlaczac jawnie GGML_JOHNV8_HCBLOCK=1.
++    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 0 : atoi(e); }();
+     return v;
+ }
+ bool ggml_cuda_hcblock_enabled() {
+-- 
+2.43.0
+

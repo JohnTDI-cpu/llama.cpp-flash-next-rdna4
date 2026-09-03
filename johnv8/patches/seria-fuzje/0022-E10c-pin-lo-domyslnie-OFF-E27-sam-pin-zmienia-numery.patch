@@ -1,0 +1,29 @@
+From 6034197df192c915ad99d4bcd01378bef82c90aa Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 01:05:53 +0200
+Subject: [PATCH 22/34] E10c: pin lo domyslnie OFF (E27: sam pin zmienia
+ numeryke przez alokacje); GGML_JOHNV8_HCBLOCK_PIN=1 wlacza
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/models/qwen4exp.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 9991bd8..5d91661 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -383,7 +383,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+     // [johnv8] E10c: jadro B czyta lo we wszystkich blokach, a alokator moglby nalozyc na nie wynik mix
+     // (lo jest martwe po hc_up w stocku) -> przypinamy lo, zeby nie bylo ponownie uzyte
+-    static const bool hcblock_pin = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr || atoi(e) != 0; }();
++    // UWAGA (E27): samo przypiecie zmienia alokacje calego grafu i ujawnia gdzies wyscig/aliasing (logity +-1 nat,
++    // niedeterministycznie) -> domyslnie WYLACZONE; bez pinu matcher B po prostu odrzuca fuzje, gdy mixed nachodzi na lo.
++    static const bool hcblock_pin = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK_PIN"); return e != nullptr && atoi(e) != 0; }();
+     if (hcblock_pin) {
+         ggml_set_output(lo);
+     }
+-- 
+2.43.0
+

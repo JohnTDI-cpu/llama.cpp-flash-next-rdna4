@@ -1,0 +1,46 @@
+From 54ae53414543231cb6ee621fa8190a7704ecd1da Mon Sep 17 00:00:00 2001
+From: johnv8 <johnv8@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 23:35:00 +0200
+Subject: [PATCH 07/34] E3: pomin set_input_qsa gdy tensory QSA bez bufora
+ (rezim gesty pod MTP); E6b: __fmul_rn/__fadd_rn dla bit-exact
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/shexp-tail.cu | 4 ++--
+ src/models/qwen4exp.cpp          | 5 +++++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/shexp-tail.cu b/ggml/src/ggml-cuda/shexp-tail.cu
+index 4cdab5c..a82f6f2 100644
+--- a/ggml/src/ggml-cuda/shexp-tail.cu
++++ b/ggml/src/ggml-cuda/shexp-tail.cu
+@@ -47,8 +47,8 @@ static __global__ void shexp_tail_f32(
+ #endif
+     const float sg = 1.0f / (1.0f + expf(-g));
+     const int64_t id = (int64_t) i + (int64_t) n_embd*t;
+-    const float m = shexp[id] * sg;
+-    dst[id] = moe_out[id] + m;
++    const float m = __fmul_rn(shexp[id], sg);   // jak binbcast MUL, bez kontrakcji FMA
++    dst[id] = __fadd_rn(moe_out[id], m);  // jak binbcast ADD
+ }
+ 
+ static bool ggml_cuda_shexp_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 326cece..9dfc540 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -805,6 +805,11 @@ public:
+ 
+     void set_input(const llama_ubatch * ubatch) override {
+         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
++        // E3 [johnv8]: w rezimie gestym (n_kv <= budzet top-k) tensory QSA nie sa w grafie,
++        // wiec alokator nie dal im bufora - klucze indeksera i tak poszly do cache'u wyzej.
++        if (cell_blk == nullptr || cell_blk->buffer == nullptr) {
++            return;
++        }
+         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+     }
+ 
+-- 
+2.43.0
+
