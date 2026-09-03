@@ -9,7 +9,7 @@ B=${BIN:-$(cd "$(dirname "$0")/../.." && pwd)/build-hip/bin}   # binarki z build
 M=${MODEL:-$HOME/models/Qwen3.8-Flash-Next-UD-IQ3_XXS/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf}
 MD=${DRAFT:-$HOME/models/Flash-Next-mtp/unsloth/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
 DEV=${DEV:-ROCm1}; ROCM=${ROCM_PATH:-/opt/rocm-7.2.4}
-PORT=${PORT:-8092}; CTX=${CTX:-32768}; NP=${NP:-2}; CPU_OD=${CPU_OD:-22}
+PORT=${PORT:-8092}; CTX=${CTX:-65536}; NP=${NP:-2}; CPU_OD=${CPU_OD:-22}
 WARSTWY=$(seq -s'|' "$CPU_OD" 47)
 export ROCM_PATH=$ROCM LD_LIBRARY_PATH="$B:$ROCM/lib"
 # [E46] HIP graphs: +2-3%; GRAFY=0 wylacza

@@ -1,3 +1,4 @@
+#include <cstring>
 #include <cstdlib>
 #include "models.h"
 #include "llama-impl.h"
@@ -309,6 +310,21 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
 //               6c5afc86a zmienia wynik (rozjazd tokenow) i jest wolniejsze
 //               (24,45 vs 24,74 t/s). Zostawione do dalszego zbadania.
 // Domyslnie 1. GGML_JOHNV8_OPT=0 przywraca zachowanie stockowe.
+// [johnv8] Fuzje jadrowe E7/E7b (prolog i l2norm w jadrze gated_delta_net) sa zweryfikowane bit-exact tylko na HIP;
+// domyslnie wlaczone wylacznie, gdy model ma urzadzenie backendu "ROCm" (env GGML_JOHNV8_GDN_PROLOG/GDN_L2 wymusza).
+static bool johnv8_backend_is_hip(const llama_model & model) {
+    static const bool v = [&model]() {
+        for (const auto & d : model.devices) {
+            ggml_backend_dev_t dev = d.dev;
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const char * n = reg ? ggml_backend_reg_name(reg) : nullptr;
+            if (n != nullptr && strcmp(n, "ROCm") == 0) { return true; }
+        }
+        return false;
+    }();
+    return v;
+}
+
 static int johnv8_opt() {
     static const int v = []() {
         const char * e = getenv("GGML_JOHNV8_OPT");
@@ -1220,7 +1236,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(beta, "beta", il);
 
     // [johnv8] E7: prolog (sigmoid beta, softplus(alpha+dt)*A) liczony w jadrze GDN -> -4 jadra/warstwe
-    static const bool gdn_prolog = []() { const char * e = getenv("GGML_JOHNV8_GDN_PROLOG"); return e == nullptr || atoi(e) != 0; }();
+    static const bool gdn_prolog = [&]() { const char * e = getenv("GGML_JOHNV8_GDN_PROLOG"); return e == nullptr ? johnv8_backend_is_hip(model) : atoi(e) != 0; }();
     if (!gdn_prolog) {
         beta = ggml_sigmoid(ctx0, beta);
         cb(beta, "beta_sigmoid", il);
@@ -1294,7 +1310,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const float eps_norm = hparams.f_norm_rms_eps;
 
     // [johnv8] E7b: l2norm q/k liczony w jadrze GDN (GGML_JOHNV8_GDN_L2=0 przywraca osobne jadra)
-    static const bool gdn_l2 = []() { const char * e = getenv("GGML_JOHNV8_GDN_L2"); return e == nullptr || atoi(e) != 0; }();
+    static const bool gdn_l2 = [&]() { const char * e = getenv("GGML_JOHNV8_GDN_L2"); return e == nullptr ? johnv8_backend_is_hip(model) : atoi(e) != 0; }();
     const bool gdn_l2_in_kernel = gdn_l2 && gdn_prolog;
     if (!gdn_l2_in_kernel) {
         q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);

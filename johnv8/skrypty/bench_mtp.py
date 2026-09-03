@@ -81,8 +81,14 @@ try:
     print(f"  {ETYK} [{BACKEND} spec={SPEC}, {48-CPU_OD} warstw na CPU] VRAM card0 {po.get('card0',0)-BAZA.get('card0',0)} / card1 {po.get('card1',0)-BAZA.get('card1',0)} MiB, "
           f"GPU0 delta {d0} MiB", flush=True)
 
-    zrodlo = (open("~/").read()
-              + open("~/").read()) * 3
+    # korpus prefillu: deterministyczny tekst syntetyczny (bez plikow zewnetrznych); dlugosc jest i tak docinana do n tokenow
+    _akapity = [
+        "Stacja meteorologiczna numer {i} zanotowala {t} stopnie, wilgotnosc {h} procent i cisnienie {p} hektopaskali. ",
+        "W raporcie dobowym {i} opisano przebieg temperatury, kierunek wiatru oraz sume opadow w milimetrach. ",
+        "Obserwator {i} porownal odczyty z poprzednim tygodniem i zaznaczyl odchylenia od normy wieloletniej. ",
+        "Zestawienie {i} zawiera tabele godzinowa, komentarz do zjawisk konwekcyjnych i prognoze na kolejna dobe. ",
+    ]
+    zrodlo = "".join(_akapity[i % 4].format(i=i, t=10 + (i * 7) % 25, h=30 + (i * 13) % 60, p=990 + (i * 3) % 40) for i in range(1200))
     toks = post("/tokenize", {"content": zrodlo})["tokens"]
     def prompt_o_dlugosci(n):
         return post("/detokenize", {"tokens": toks[:n]})["content"]
@@ -105,8 +111,8 @@ try:
         w[f"pp{n}"]=med(pf); w[f"pp{n}_all"]=[round(x,1) for x in pf]; w[f"pp{n}_tok"]=realne
         print(f"    pp{n:<5} ({realne:>4} tok)  {a:7.1f} +- {s:5.1f} t/s   {[round(x,1) for x in pf]}", flush=True)
 
-    PROMPTY={"proza":"Opisz budowe silnika wysokopreznego.",
-             "kod":"Napisz w Pythonie funkcje, ktora parsuje CSV z ofertami aut (marka, model, rok, przebieg, cena) i zwraca mediane ceny dla kazdego rocznika. Z obsluga bledow i typowaniem."}
+    PROMPTY={"proza":"Opisz, jak powstaje tecza.",
+             "kod":"Napisz w Pythonie funkcje, ktora parsuje CSV z odczytami stacji pogodowych (stacja, data, temperatura, wilgotnosc) i zwraca mediane temperatury dla kazdego miesiaca. Z obsluga bledow i typowaniem."}
     for nazwa,tresc in PROMPTY.items():
         tg=[]
         for _ in range(int(os.environ.get("POWT","5"))):
@@ -122,6 +128,6 @@ try:
     dl=re.findall(r"mean len =\s*([0-9.]+)", log)
     w["akceptacja"]=ak[-1] if ak else None; w["mean_len"]=dl[-1] if dl else None
     if SPEC!="none": print(f"    draft: akceptacja {w['akceptacja']}, dlugosc {w['mean_len']}", flush=True)
-    json.dump(w, open(f"~/","w"), indent=2)
+    json.dump(w, open(os.path.join(os.environ.get("BENCH_DIR", "."), f"bench_{ETYK}.json"), "w"), indent=2)
 finally:
     ubij()

@@ -23,7 +23,7 @@ Everything in this fork beyond upstream llama.cpp and PR #28243 — the profilin
 
 This is a working fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) built on top of **PR #28243** (Qwen3.8-Flash-Next / `qwen4exp` support, commit `2857e511`) with a series of HIP-backend changes for AMD RDNA4 (gfx1201, Radeon AI PRO R9700). Every change that is enabled by default is **bit-exact** with the stock kernels: at temperature 0 the model produces identical tokens on a short and a ~1500-token prompt (gate script in `johnv8/skrypty/bitexact.sh`), so quality is exactly that of the upstream PR.
 
-Measured with **Qwen3.8-Flash-Next UD-IQ3_XXS** (unsloth, 82 GB) + the unsloth MTP draft head (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), context 65536 × 2 slots, ubatch 512, MTP n-max 3, 32 CPU threads, `OMP_WAIT_POLICY=active`, ROCm 7.2.4, EPYC 7543, 125 GB RAM.
+Measured with **Qwen3.8-Flash-Next UD-IQ3_XXS** (Hugging Face `unsloth/Qwen3.8-Flash-Next-GGUF`, folder `UD-IQ3_XXS`, 82 GB) + the MTP draft head from the same repository's `MTP` folder (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), context 65536 × 2 slots, ubatch 512, MTP n-max 3, 32 CPU threads, `OMP_WAIT_POLICY=active`, ROCm 7.2.4, EPYC 7543, 125 GB RAM.
 
 ## Results vs the stock unsloth build (b10715, Vulkan) — same model, same settings
 
@@ -110,9 +110,9 @@ build-hip/bin/llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf 
   --flash-attn on -ub 512 -b 1536 -t 32 -tb 48 --jinja --reasoning-format deepseek
 ```
 
-Two GPUs: `--device ROCm0,ROCm1 -ts 1,1.2 -ot per_layer_token_embd=CPU --cache-type-k f16 --cache-type-v f16`. Details, sizing rules (`CPU_OD` vs VRAM), the benchmark procedure and the baseline setup: `johnv8/docs/README_ODTWORZENIE.md`.
+Two GPUs: `--device ROCm0,ROCm1 -ts 1,1.2 -ot per_layer_token_embd=CPU --cache-type-k f16 --cache-type-v f16`. Details, sizing rules (`CPU_OD` vs VRAM), the benchmark procedure and the baseline setup: `johnv8/docs/README_ODTWORZENIE.md`. The decode prompts shipped in `bench_mtp.py`/`bitexact.sh` are neutral replacements of the same shape and length as the ones used for the tables above; with MTP the absolute t/s depends on prompt content, so compare builds with the same prompts rather than against these tables to the decimal. For reference, the shipped prompts give 46.5 / 48.7 t/s (prose / code, MTP, 1 GPU + CPU, hosting config) on this machine, with the same 0.61 draft acceptance for the old and the new tree.
 
-Other architectures: change `AMDGPU_TARGETS`; the fusions were verified bit-exact on gfx1201 only, so run `johnv8/skrypty/bitexact.sh` first (note: on HIP `__fmul_rn/__fadd_rn` do not match `a*b`/`a+b` bit-for-bit, which is why the replicas use plain operators under `#pragma clang fp contract(off)`).
+Other architectures and backends: change `AMDGPU_TARGETS`; the fusions were verified bit-exact on gfx1201 only, so run `johnv8/skrypty/bitexact.sh` first on anything else. On non-HIP builds (CUDA/MUSA) the kernel-side fusions are compiled out (`johnv8_backend_ok()`), the in-kernel GDN prolog/l2norm defaults to off unless a ROCm device is present, and the no-contraction helpers fall back to `__fmul_rn/__fadd_rn` — so a CUDA build behaves like the upstream PR plus graph-level glue. (On HIP the replicas must use plain operators under `#pragma clang fp contract(off)`: the rn intrinsics do not match `a*b`/`a+b` bit-for-bit on gfx1201.)
 
 ## Things that were tried and do not help on ROCm 7.2.4 / RDNA4
 

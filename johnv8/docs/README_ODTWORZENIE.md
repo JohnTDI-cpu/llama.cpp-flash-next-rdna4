@@ -93,7 +93,7 @@ Skrypty biorą ścieżki ze zmiennych środowiskowych: `MODEL` (pierwszy shard m
 
 ### 4.2 Punkt wyjścia: llama.cpp z PR 28243
 
-Baza to **ggml-org/llama.cpp, PR #28243** (obsługa architektury `qwen4exp`, czyli Qwen3.8-Flash-Next) w wersji z 2026-09-02, commit **`2857e511`** (pobraliśmy tarball tego commitu z GitHuba). Drzewo z PR-em nałożonym na jego bazę leży w naszym repo jako pierwszy commit `aa382d3 "PR 28243 base (tarball 2857e511)"`.
+Baza to **ggml-org/llama.cpp, PR #28243** (obsługa architektury `qwen4exp`, czyli Qwen3.8-Flash-Next) w wersji z 2026-09-02, commit **`2857e511`** (pobraliśmy tarball tego commitu z GitHuba). W tym repozytorium historia zaczyna się od prawdziwego commitu `2857e5114` (głowa PR #28243), a nasze 34 commity leżą bezpośrednio na nim — wystarczy `git clone` i `git checkout master`.
 
 Dwie drogi:
 
@@ -144,7 +144,7 @@ cmake --build build-hip -j 16
 
 ### 5.1 Pliki
 
-Z Hugging Face (repozytorium unsloth dla Qwen3.8-Flash-Next w GGUF):
+Z Hugging Face, repozytorium `unsloth/Qwen3.8-Flash-Next-GGUF` (foldery `UD-IQ3_XXS/` i `MTP/`):
 - `UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-0000{1,2,3}-of-00003.gguf` (10,9 MB + 49,6 GB + 32,4 GB = ~82 GB),
 - folder `MTP/`: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2,8 GB; wariant „shared” dzieli embeddingi z modelem — używaliśmy tego).
 
@@ -227,7 +227,7 @@ Zasady, które okazały się konieczne:
 ./bitexact.sh $B $B jcap GGML_JOHNV8_MMQ_ID_JMAX=32
 ```
 
-Uruchamia serwer A, potem B (na `ROCm1`, ctx 8192, KV q8_0, grafy HIP wyłączone w harnessie, `--temp 0`), generuje 200 tokenów na dwóch promptach: `[k]` krótki („Silnik 2.0 TDI w Passacie B6…”) i `[d]` długi (~1500 tokenów: 60 powtórzeń oferty + pytanie) i porównuje teksty. Werdykt `IDENTYCZNE` na obu = wariant bit-exact. Kontrola: A vs A musi być identyczne; pusty tekst = błąd, nie sukces. Dla zmian sprzętowych (inna architektura GPU) uruchom ją najpierw dla całego builda (`GGML_JOHNV8_*=0` wszystkie vs domyślne).
+Uruchamia serwer A, potem B (na `ROCm1`, ctx 8192, KV q8_0, grafy HIP wyłączone w harnessie, `--temp 0`), generuje 96 tokenów na krótkim prompcie `[k]` (pytanie o tęczę) i 48 tokenów na długim `[d]` (~1500 tokenów: 60 powtórzeń zdania o stacji pomiarowej + pytanie) i porównuje teksty. Werdykt `IDENTYCZNE` na obu = wariant bit-exact. Kontrola: A vs A musi być identyczne; pusty tekst = błąd, nie sukces. Dla zmian sprzętowych (inna architektura GPU) uruchom ją najpierw dla całego builda (`GGML_JOHNV8_*=0` wszystkie vs domyślne).
 
 Grafy HIP sprawdzono osobno (E48, 3 bramki): bit-exact.
 
@@ -279,7 +279,7 @@ git am johnv8/patches/seria-fuzje/*.patch
 # 2. build (gfx1201 → wpisz swoją architekturę)
 johnv8/skrypty/buduj_hip.sh "$PWD" 16 gfx1201
 # 3. serwer 1×GPU + CPU (ścieżki do modeli i drzewa na początku skryptu)
-MODEL=… DRAFT=… DEV=ROCm0 johnv8/skrypty/start_flashnext_fuzje.sh   # PORT=8092, CTX=32768/65536, NP=2, CPU_OD=22, WATKI=32
+MODEL=… DRAFT=… DEV=ROCm0 johnv8/skrypty/start_flashnext_fuzje.sh   # PORT=8092, CTX=65536, NP=2, CPU_OD=22, WATKI=32
 # 4. bramka jakości i benchmark
 MODEL=… DEV=ROCm0 CARD=card0 johnv8/skrypty/bitexact.sh build-hip/bin build-hip/bin kontrola          # A=A → IDENTYCZNE
 BIN=$PWD/build-hip/bin ETYK=nasz SPEC=draft-mtp NMAX=3 PMIN=0 CPU_OD=22 CTX=65536 NP=2 UB=512 KV=q8_0 WATKI=32 POWT=4 TG_ONLY=0 GRAFY_OFF=0 \

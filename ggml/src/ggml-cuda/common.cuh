@@ -1415,13 +1415,30 @@ struct ggml_cuda_stream_context {
 
 // [johnv8] mnozenie/dodawanie bez kontrakcji FMA — dokladnie jak osobne jadra binbcast (a*b, a+b).
 // UWAGA: NIE uzywac __fmul_rn/__fadd_rn: na HIP (gfx1201) daja inne bity niz zwykle a*b / a+b (test tail_variants: 15% roznic).
+// Fuzje johnv8 (repliki jader stockowych) sa zweryfikowane bit-exact tylko na HIP/gfx1201; na innych backendach
+// (CUDA/MUSA) matchery sa wylaczone kompilacyjnie (johnv8_backend_ok), a helpery uzywaja intrinsics rn.
+static __host__ __device__ constexpr bool johnv8_backend_ok() {
+#if defined(GGML_USE_HIP)
+    return true;
+#else
+    return false;
+#endif
+}
 static __device__ __forceinline__ float johnv8_mul_nc(const float a, const float b) {
+#if defined(GGML_USE_HIP)
 #pragma clang fp contract(off)
     return a * b;
+#else
+    return __fmul_rn(a, b);
+#endif
 }
 static __device__ __forceinline__ float johnv8_add_nc(const float a, const float b) {
+#if defined(GGML_USE_HIP)
 #pragma clang fp contract(off)
     return a + b;
+#else
+    return __fadd_rn(a, b);
+#endif
 }
 
 // [johnv8] E6d: pamiec podreczna kwantyzacji Q8_1 aktywacji (src1) dla mmvq.

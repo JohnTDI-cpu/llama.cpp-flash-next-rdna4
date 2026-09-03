@@ -4229,7 +4229,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [johnv8] E4: migawki stanu conv (n_slots x CPY -> 1 jadro), patrz ggml-cuda/conv-snap.cu
     {
         int snap_nodes = 0;
-        if (ggml_cuda_conv_snap_ok(cgraph, i, &snap_nodes) && snap_nodes > 1) {
+        if (johnv8_backend_ok() && ggml_cuda_conv_snap_ok(cgraph, i, &snap_nodes) && snap_nodes > 1) {
             ggml_cuda_op_conv_snap(*cuda_ctx, cgraph, i, snap_nodes);
             return snap_nodes - 1;
         }
@@ -4242,14 +4242,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int hc_mix_nodes = 0;
         // hc_mix_nodes > 1 to twardy warunek, nie kosmetyka: zwrocenie <= 0 cofa licznik
         // petli ewaluacji i backend w kolko uruchamia ten sam wezel.
-        if (ggml_cuda_hc_mix_collapse_ok(cgraph, i, &hc_mix_nodes) && hc_mix_nodes > 1) {
+        if (johnv8_backend_ok() && ggml_cuda_hc_mix_collapse_ok(cgraph, i, &hc_mix_nodes) && hc_mix_nodes > 1) {
             ggml_cuda_op_hc_mix_collapse(*cuda_ctx, cgraph, i);
             return hc_mix_nodes - 1;
         }
     }
 
     // [johnv8] SCALE + UNARY(SILU) -> jedno jadro (hc_down w build_hc_mix)
-    if (ggml_cuda_scale_silu_ok(cgraph, i)) {
+    if (johnv8_backend_ok() && ggml_cuda_scale_silu_ok(cgraph, i)) {
         ggml_cuda_op_scale_silu(*cuda_ctx, cgraph, i);
         return 1;
     }
@@ -4276,33 +4276,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE,
               GGML_OP_VIEW,    GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD },
             { GGML_UNARY_OP_SIGMOID }))
-        && ggml_cuda_hc_combine_ok(cgraph, i)) {
+        && johnv8_backend_ok() && ggml_cuda_hc_combine_ok(cgraph, i)) {
         ggml_cuda_op_hc_combine(*cuda_ctx, cgraph, i);
         return 7;
     }
 
     // [johnv8] E10c: blok hc w dwoch jadrach (A: norm..silu, B: hc_up..mix)
-    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_hcblock_a_ok(cgraph, i)) {
+    if (johnv8_backend_ok() && node->op == GGML_OP_RMS_NORM && ggml_cuda_hcblock_a_ok(cgraph, i)) {
         ggml_cuda_op_hcblock_a(*cuda_ctx, cgraph, i);
         return 5;
     }
     if (node->op == GGML_OP_MUL_MAT) {
         int n_extra = 0;
-        if (ggml_cuda_hcblock_b_ok(cgraph, i, &n_extra)) {
+        if (johnv8_backend_ok() && ggml_cuda_hcblock_b_ok(cgraph, i, &n_extra)) {
             ggml_cuda_op_hcblock_b(*cuda_ctx, cgraph, i, n_extra);
             return n_extra;
         }
     }
 
     // [johnv8] E10a: MUL_MAT(hc_inject) + lancuch combine (9 wezlow) -> jedno jadro
-    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_hc_combine_inject_ok(cgraph, i)) {
+    if (johnv8_backend_ok() && node->op == GGML_OP_MUL_MAT && ggml_cuda_hc_combine_inject_ok(cgraph, i)) {
         ggml_cuda_op_hc_combine_inject(*cuda_ctx, cgraph, i);
         return 8;
     }
 
     // [johnv8] E6b: sigmoid(gate) * shexp + moe_out -> jedno jadro
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { GGML_UNARY_OP_SIGMOID })
-        && ggml_cuda_shexp_tail_ok(cgraph, i)) {
+        && johnv8_backend_ok() && ggml_cuda_shexp_tail_ok(cgraph, i)) {
         ggml_cuda_op_shexp_tail(*cuda_ctx, cgraph, i);
         return 2;
     }

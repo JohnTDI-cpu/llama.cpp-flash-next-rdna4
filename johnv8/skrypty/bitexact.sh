@@ -5,8 +5,8 @@ set -u; A=$1; B=$2; E=$3; shift 3
 M=${MODEL:-$HOME/models/Qwen3.8-Flash-Next-UD-IQ3_XXS/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf}
 ROCM=${ROCM_PATH:-/opt/rocm-7.2.4}; DEV=${DEV:-ROCm1}; CARD=${CARD:-card1}
 OT=${OT:-'per_layer_token_embd=CPU,blk\.(2[3-9]|3[0-9]|4[0-7])\.ffn_.*_exps=CPU'}; S=${SCRATCH:-/tmp/bitexact}; mkdir -p "$S"
-PK="Silnik 2.0 TDI w Passacie B6: opisz typowe usterki, po kolei, rzeczowo."
-PD="$(python3 -c "print(('Oferta: Skoda Octavia III 1.6 TDI, rok 2016, przebieg 187 tys. km, cena 38 900 zl. ' * 60) + 'Ktora z tych ofert jest najtansza? Odpowiedz jednym zdaniem.')")"
+PK="Wyjasnij, jak powstaje tecza: po kolei, rzeczowo."
+PD="$(python3 -c "print(('Stacja pomiarowa: Krakow, temperatura 21,5 stopnia, wilgotnosc 48 procent, cisnienie 1013 hPa, wiatr 12 km/h. ' * 60) + 'Ktora z tych stacji ma najwyzsza temperature? Odpowiedz jednym zdaniem.')")"
 gen() {
   local BIN=$1 TAG=$2; shift 2
   env "$@" LD_LIBRARY_PATH=$BIN:$ROCM/lib ROCM_PATH=$ROCM GGML_CUDA_DISABLE_GRAPHS=1 "$BIN/llama-server" -m "$M" --host 127.0.0.1 --port 8097 --device $DEV -ngl 99 --fit off -ot "$OT" -c 8192 -np 1 --cache-type-k q8_0 --cache-type-v q8_0 -fa on -t 48 --no-warmup > /tmp/bitexact_$TAG.log 2>&1 &
