@@ -14,7 +14,7 @@
 // Arytmetyka replikuje bit w bit: norm.cu, binbcast MUL, quantize.cu, mmvq.cu (tablica RDNA4), hc-mix.cu.
 #define HCB_NORM_THREADS 1024
 #define HCB_MAX_NT       4
-#define HCB_B_THREADS    1024
+#define HCB_B_THREADS    256
 #define HCB_B_ELEMS      8
 
 static int ggml_cuda_hcblock_mode() {
@@ -190,7 +190,7 @@ hcblock_b1_f32(const block_q8_1 * __restrict__ yq2, const void * __restrict__ Wu
     constexpr int vthreads  = nwarps * warp_size;
     constexpr int VB        = HCB_B_THREADS / vthreads;
     constexpr int E         = HCB_B_ELEMS;
-    static_assert(VB * rows == 4 * E, "VB*rows musi byc 32 (4 strumienie x 8 elementow)");
+    static_assert(VB * rows == E, "VB*rows musi byc 8");
     constexpr int qk = QK8_0, qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ;
     constexpr int blocks_per_iter = vdr * nwarps * warp_size / qi;
     __shared__ float tmp_shared[VB][nwarps > 1 ? nwarps - 1 : 1][ncols_dst][rows][warp_size];
@@ -202,12 +202,9 @@ hcblock_b1_f32(const block_q8_1 * __restrict__ yq2, const void * __restrict__ Wu
     const int v = tid / vthreads, vtid = tid - v * vthreads, vwarp = vtid / warp_size, vlane = vtid - vwarp * warp_size;
     const int blocks_per_row_x = R / qk;
     const int kqs = vdr * (vtid % (qi / vdr));
-    {
-        // wiersze plaskie r = v*rows + i w [0,32): strumien c = r / E, element e = r % E; wymaga hc == 4
-        const int rflat0 = v * rows;
-        const int c      = rflat0 / E;
-        const int e0     = rflat0 - c * E;
-        const int row0   = c * n_embd + i0 + e0;
+    for (int c = 0; c < hc; ++c) {
+        const int e0   = v * rows;
+        const int row0 = c * n_embd + i0 + e0;
         float tmp[ncols_dst][rows];
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
