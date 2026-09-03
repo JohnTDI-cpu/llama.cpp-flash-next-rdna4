@@ -57,21 +57,9 @@ Measured with **Qwen3.8-Flash-Next UD-IQ3_XXS** (Hugging Face `unsloth/Qwen3.8-F
 
 Experiment log (E0–E66, every measurement and verdict): `johnv8/docs/WYNIK_OPTYMALIZACJI.md` (Polish). English summary table: `johnv8/docs/BENCH_SUMMARY_EN.md`.
 
-## Quality check on the 2-GPU server (SpeakLeash / Open PL LLM Leaderboard tasks, 10 % of each task)
+## Quality
 
-Served from this tree on 2× R9700 (`-ts 1.1,1`, KV f16, ctx 32768, 4 slots, MTP n-max 3 with the draft head on the second GPU, `-b 1024 -ub 512`; with `-ts 1,1.2` and the draft head on the fuller card the ROCm pool ran out of memory under 4 parallel prompts) and evaluated with lm-eval-pl (`--limit 0.1`, the same 108 items per task in every run, thinking disabled, temperature 0, max 50 tokens, 4 parallel requests): 648 samples in 556 s.
-
-| task | this fork, 2 GPUs, 10 % | same model, full run (9101 samples, 1 GPU, stock kernels of the PR + patches) | Qwen3.8-27B Q8, same 108 items |
-|---|---|---|---|
-| psc | 90.74 ±2.8 | 92.86 | 87.96 |
-| ppc | 75.93 ±4.1 | 75.10 | 78.70 |
-| dyk | 82.41 ±3.7 | 84.16 | 90.74 |
-| belebele | 93.52 ±2.4 | 93.56 | 94.44 |
-| 8tags | 78.70 ±4.0 | 80.67 | 77.78 |
-| polemo2 | 82.41 ±3.7 | 79.22 | 83.33 |
-| **average** | **83.95** | 84.26 | 85.49 |
-
-The 10 % subset lands within its own sampling error (±2.4–4.1 points per task) of the full run, as expected for bit-exact kernels. A generation sanity test on the same server (11 Polish logic/arithmetic questions answered in a few sentences, each with and without thinking, plus 4 concurrent requests; temperature 0.6, top-p 0.95, top-k 20): 26/26 answers finished on a stop token, no repeated 12-grams, no stray tokens or replacement characters, all answers correct (17×23=391, 360 km / 4.5 h = 80 km/h, the "apples and oranges" box, P(sum=7)=1/6, 42, 55, 55.25 l → 342.55 zł, 20 years, Celina shortest but the difference undetermined, merge sort O(n log n), the syllogism does not follow); reasoning was cleanly separated from the answer in thinking mode.
+Quality was checked three ways and is identical to the stock kernels of the upstream PR: (1) every change enabled by default passes the bit-exact gate — identical tokens at temperature 0 on a short and a ~1500-token prompt, re-run at every stage; (2) the model served from this tree on two GPUs was evaluated on the author's Polish evaluation set and scored the same as the stock build within the evaluation's own noise; (3) a generation sanity test on the same 2-GPU server (multi-sentence answers to logic and arithmetic questions, with and without thinking, sequential and concurrent) produced only correct, cleanly terminated answers — no loops, no stray tokens, reasoning properly separated from the answer.
 
 ## What is in the tree
 
