@@ -120,10 +120,9 @@ Other architectures and backends: change `AMDGPU_TARGETS`; the fusions were veri
 - `GPU_MAX_HW_QUEUES=8`: within noise.
 - Any-order launches with a hazard tracker (`johnv8/patches/e64_anyorder.patch`, `GGML_JOHNV8_ANYORDER=1`): bit-exact, 15 % of launches barrier-free, +2–4 % decode on 2 GPUs without MTP, +1 % with MTP, 0 on 1 GPU; the remaining barriers are real dependency chains, and the flag is dropped by HIP graph capture, so it is used only for graphs of ≥ 400 nodes.
 
-## Branches
+## Repository layout
 
-- `master` — this work (PR #28243 base + fusions + docs). The previous `master` is kept as `archiwum-master-2026-09-03`.
-- `johnv8-mtp` — the earlier round (PR #27742 base + MTP port), kept for reference.
+A single branch, `master`: upstream llama.cpp history up to the head of PR #28243 (`2857e511`), then the 34 kernel/glue commits described above, then the `johnv8/` documentation, scripts and patches. No upstream tags or other branches are mirrored here; this is a standalone snapshot, not a GitHub fork, and no pull request to upstream is intended.
 
 ## Credits and license
 
