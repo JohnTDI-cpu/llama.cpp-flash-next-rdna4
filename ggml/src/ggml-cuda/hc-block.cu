@@ -18,8 +18,8 @@
 #define HCB_B_ELEMS      8
 
 static int ggml_cuda_hcblock_mode() {
-    // domyslnie OFF do walidacji v2 (E39); 1 = oba jadra, 2 = tylko A (A0+A1), 3 = tylko B (wymaga A dla kwantyzacji lo -> w praktyce = 1)
-    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 0 : atoi(e); }();
+    // 0 = OFF, 1 = oba jadra (domyslnie), 2 = tylko A (A0+A1), 3 = tylko B (wymaga A dla kwantyzacji lo -> w praktyce = 1)
+    static const int v = []() { const char * e = getenv("GGML_JOHNV8_HCBLOCK"); return e == nullptr ? 1 : atoi(e); }();   // v3b: bit-exact, +3% bez MTP, +0,6% z MTP (E45) -> domyslnie ON
     return v;
 }
 bool ggml_cuda_hcblock_enabled() { return ggml_cuda_hcblock_mode() != 0; }
